@@ -1,0 +1,122 @@
+using System.Diagnostics;
+using System.Linq;
+
+using Dalamud.Game;
+using Dalamud.IoC;
+using Dalamud.IoC.Internal;
+using Dalamud.Plugin.Internal.Types;
+using Dalamud.Plugin.Services;
+using Dalamud.Utility;
+using Dalamud.Utility.Signatures;
+
+using Serilog;
+
+namespace Dalamud.Hooking.Internal;
+
+/// <summary>
+/// Plugin-scoped version of service used to create hooks.
+/// </summary>
+[PluginInterface]
+[ServiceManager.ScopedService]
+#pragma warning disable SA1015
+[ResolveVia<IGameInteropProvider>]
+#pragma warning restore SA1015
+internal class GameInteropProviderPluginScoped : IGameInteropProvider, IInternalDisposableService
+{
+    private readonly LocalPlugin plugin;
+    private readonly SigScanner scanner;
+
+    private readonly WeakConcurrentCollection<IDalamudHook> trackedHooks = [];
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="GameInteropProviderPluginScoped"/> class.
+    /// </summary>
+    /// <param name="plugin">Plugin this instance belongs to.</param>
+    /// <param name="scanner">SigScanner instance for target module.</param>
+    public GameInteropProviderPluginScoped(LocalPlugin plugin, TargetSigScanner scanner)
+    {
+        this.plugin = plugin;
+        this.scanner = scanner;
+    }
+
+    /// <inheritdoc/>
+    public void InitializeFromAttributes(object self)
+    {
+        foreach (var hook in SignatureHelper.Initialize(self, callingAssembly: this.plugin.Assembly))
+            this.trackedHooks.Add(hook);
+    }
+
+    /// <inheritdoc/>
+    public Hook<T> HookFromFunctionPointerVariable<T>(nint address, T detour) where T : Delegate
+    {
+        var hook = Hook<T>.FromFunctionPointerVariable(address, detour, this.plugin.Assembly);
+        this.trackedHooks.Add(hook);
+        return hook;
+    }
+
+    /// <inheritdoc/>
+    public Hook<T> HookFromImport<T>(ProcessModule? module, string moduleName, string functionName, uint hintOrOrdinal, T detour) where T : Delegate
+    {
+        var hook = Hook<T>.FromImport(module, moduleName, functionName, hintOrOrdinal, detour, this.plugin.Assembly);
+        this.trackedHooks.Add(hook);
+        return hook;
+    }
+
+    /// <inheritdoc/>
+    public Hook<T> HookFromSymbol<T>(string moduleName, string exportName, T detour, IGameInteropProvider.HookBackend backend = IGameInteropProvider.HookBackend.Automatic) where T : Delegate
+    {
+        WarnForDeprecatedBackend(backend);
+
+        var hook = Hook<T>.FromSymbol(moduleName, exportName, detour, callingAssembly: this.plugin.Assembly);
+        this.trackedHooks.Add(hook);
+        return hook;
+    }
+
+    /// <inheritdoc/>
+    public Hook<T> HookFromAddress<T>(nint procAddress, T detour, IGameInteropProvider.HookBackend backend = IGameInteropProvider.HookBackend.Automatic) where T : Delegate
+    {
+        WarnForDeprecatedBackend(backend);
+
+        var hook = Hook<T>.FromAddress(procAddress, detour, callingAssembly: this.plugin.Assembly);
+        this.trackedHooks.Add(hook);
+        return hook;
+    }
+
+    /// <inheritdoc/>
+    public Hook<T> HookFromAddress<T>(UIntPtr procAddress, T detour, IGameInteropProvider.HookBackend backend = IGameInteropProvider.HookBackend.Automatic) where T : Delegate
+        => this.HookFromAddress((nint)procAddress, detour, backend);
+
+    /// <inheritdoc/>
+    public unsafe Hook<T> HookFromAddress<T>(void* procAddress, T detour, IGameInteropProvider.HookBackend backend = IGameInteropProvider.HookBackend.Automatic) where T : Delegate
+        => this.HookFromAddress((nint)procAddress, detour, backend);
+
+    /// <inheritdoc/>
+    public Hook<T> HookFromSignature<T>(string signature, T detour, IGameInteropProvider.HookBackend backend = IGameInteropProvider.HookBackend.Automatic) where T : Delegate
+        => this.HookFromAddress(this.scanner.ScanText(signature), detour, backend);
+
+    /// <inheritdoc/>
+    void IInternalDisposableService.DisposeService()
+    {
+        var notDisposed = this.trackedHooks.Where(x => !x.IsDisposed).ToArray();
+        if (notDisposed.Length != 0)
+            Log.Warning("{PluginName} is leaking {Num} hooks! Make sure that all of them are disposed properly.", this.plugin.InternalName, notDisposed.Length);
+
+        foreach (var hook in notDisposed)
+        {
+            Log.Warning("\t\t\tLeaked hook at +0x{Address:X}", hook.Address.ToInt64() - this.scanner.Module.BaseAddress.ToInt64());
+            hook.Dispose();
+        }
+
+        this.trackedHooks.Clear();
+    }
+
+    private static void WarnForDeprecatedBackend(IGameInteropProvider.HookBackend backend)
+    {
+#pragma warning disable CS0618 // Type or member is obsolete
+        if (backend == IGameInteropProvider.HookBackend.MinHook)
+        {
+            Log.Warning("The MinHook backend is no longer available, and backend selection will be removed in a future version. Please specify 'Automatic' instead.");
+        }
+#pragma warning restore CS0618 // Type or member is obsolete
+    }
+}

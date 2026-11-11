@@ -1,0 +1,97 @@
+using Dalamud.Bindings.ImGui;
+using Dalamud.Game.ClientState.Objects;
+using Dalamud.Interface.Utility;
+using Dalamud.Utility;
+
+namespace Dalamud.Interface.Internal.Windows.Data.Widgets;
+
+/// <summary>
+/// Widget for displaying target info.
+/// </summary>
+internal class TargetWidget : IDataWindowWidget
+{
+    private bool resolveGameData;
+
+    /// <inheritdoc/>
+    public string[]? CommandShortcuts { get; init; } = ["target"];
+
+    /// <inheritdoc/>
+    public string DisplayName { get; init; } = "Target";
+
+    /// <inheritdoc/>
+    public bool Ready { get; set; }
+
+    /// <inheritdoc/>
+    public void Load()
+    {
+        this.Ready = true;
+    }
+
+    /// <inheritdoc/>
+    public void Draw()
+    {
+        ImGui.Checkbox("Resolve GameData"u8, ref this.resolveGameData);
+
+        var objectTable = Service<ObjectTable>.Get();
+        var targetMgr = Service<TargetManager>.Get();
+
+        if (targetMgr.Target != null)
+        {
+            Util.PrintGameObject(targetMgr.Target, "CurrentTarget", this.resolveGameData);
+
+            ImGui.Text("Target"u8);
+            Util.ShowGameObjectStruct(targetMgr.Target);
+
+            var tot = targetMgr.Target.TargetObject;
+            if (tot != null)
+            {
+                ImGuiHelpers.ScaledDummy(10);
+
+                ImGui.Separator();
+                ImGui.Text("ToT"u8);
+                Util.ShowGameObjectStruct(tot);
+            }
+
+            ImGuiHelpers.ScaledDummy(10);
+        }
+
+        if (targetMgr.FocusTarget != null)
+            Util.PrintGameObject(targetMgr.FocusTarget, "FocusTarget", this.resolveGameData);
+
+        if (targetMgr.MouseOverTarget != null)
+            Util.PrintGameObject(targetMgr.MouseOverTarget, "MouseOverTarget", this.resolveGameData);
+
+        if (targetMgr.PreviousTarget != null)
+            Util.PrintGameObject(targetMgr.PreviousTarget, "PreviousTarget", this.resolveGameData);
+
+        if (targetMgr.SoftTarget != null)
+            Util.PrintGameObject(targetMgr.SoftTarget, "SoftTarget", this.resolveGameData);
+
+        if (targetMgr.GPoseTarget != null)
+            Util.PrintGameObject(targetMgr.GPoseTarget, "GPoseTarget", this.resolveGameData);
+
+        if (targetMgr.MouseOverNameplateTarget != null)
+            Util.PrintGameObject(targetMgr.MouseOverNameplateTarget, "MouseOverNameplateTarget", this.resolveGameData);
+
+        if (ImGui.Button("Clear CT"u8))
+            targetMgr.Target = null;
+
+        if (ImGui.Button("Clear FT"u8))
+            targetMgr.FocusTarget = null;
+
+        var localPlayer = objectTable.LocalPlayer;
+
+        if (localPlayer != null)
+        {
+            if (ImGui.Button("Set CT"u8))
+                targetMgr.Target = localPlayer;
+
+            if (ImGui.Button("Set FT"u8))
+                targetMgr.FocusTarget = localPlayer;
+        }
+        else
+        {
+            ImGui.Text("LocalPlayer is null."u8);
+        }
+    }
+}

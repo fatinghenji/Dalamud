@@ -1,0 +1,161 @@
+using System.Collections.Generic;
+
+using Dalamud.Bindings.ImGui;
+using Dalamud.Configuration.Internal;
+using Dalamud.Game.Inventory;
+using Dalamud.Game.Inventory.InventoryEventArgTypes;
+using Dalamud.Interface.Colors;
+using Dalamud.Interface.Utility.Raii;
+using Dalamud.Logging.Internal;
+
+using Serilog.Events;
+
+namespace Dalamud.Interface.Internal.Windows.Data;
+
+/// <summary>
+/// Tester for <see cref="GameInventory"/>.
+/// </summary>
+internal class GameInventoryTestWidget : IDataWindowWidget
+{
+    private static readonly ModuleLog Log = ModuleLog.Create<GameInventoryTestWidget>();
+
+    private GameInventoryPluginScoped? scoped;
+    private bool standardEnabled;
+    private bool rawEnabled;
+
+    /// <inheritdoc/>
+    public string[]? CommandShortcuts { get; init; } = ["gameinventorytest"];
+
+    /// <inheritdoc/>
+    public string DisplayName { get; init; } = "GameInventory Test";
+
+    /// <inheritdoc/>
+    public bool Ready { get; set; }
+
+    /// <inheritdoc/>
+    public void Load() => this.Ready = true;
+
+    /// <inheritdoc/>
+    public void Draw()
+    {
+        if (Service<DalamudConfiguration>.Get().LogLevel > LogEventLevel.Information)
+        {
+            ImGui.TextColoredWrapped(
+                ImGuiColors.AttentionForeground,
+                "Enable LogLevel=Information display to see the logs."u8);
+        }
+
+        using var table = ImRaii.Table(this.DisplayName, 3, ImGuiTableFlags.SizingFixedFit);
+        if (!table.Success)
+            return;
+
+        ImGui.TableNextColumn();
+        ImGui.Text("Standard Logging"u8);
+
+        ImGui.TableNextColumn();
+        using (ImRaii.Disabled(this.standardEnabled))
+        {
+            if (ImGui.Button("Enable##standard-enable"u8) && !this.standardEnabled)
+            {
+                this.scoped ??= new();
+                this.scoped.InventoryChanged += ScopedOnInventoryChanged;
+                this.standardEnabled = true;
+            }
+        }
+
+        ImGui.TableNextColumn();
+        using (ImRaii.Disabled(!this.standardEnabled))
+        {
+            if (ImGui.Button("Disable##standard-disable"u8) && this.scoped is not null && this.standardEnabled)
+            {
+                this.scoped.InventoryChanged -= ScopedOnInventoryChanged;
+                this.standardEnabled = false;
+                if (!this.rawEnabled)
+                {
+                    ((IInternalDisposableService)this.scoped).DisposeService();
+                    this.scoped = null;
+                }
+            }
+        }
+
+        ImGui.TableNextRow();
+
+        ImGui.TableNextColumn();
+        ImGui.Text("Raw Logging"u8);
+
+        ImGui.TableNextColumn();
+        using (ImRaii.Disabled(this.rawEnabled))
+        {
+            if (ImGui.Button("Enable##raw-enable"u8) && !this.rawEnabled)
+            {
+                this.scoped ??= new();
+                this.scoped.InventoryChangedRaw += ScopedOnInventoryChangedRaw;
+                this.rawEnabled = true;
+            }
+        }
+
+        ImGui.TableNextColumn();
+        using (ImRaii.Disabled(!this.rawEnabled))
+        {
+            if (ImGui.Button("Disable##raw-disable"u8) && this.scoped is not null && this.rawEnabled)
+            {
+                this.scoped.InventoryChangedRaw -= ScopedOnInventoryChangedRaw;
+                this.rawEnabled = false;
+                if (!this.standardEnabled)
+                {
+                    ((IInternalDisposableService)this.scoped).DisposeService();
+                    this.scoped = null;
+                }
+            }
+        }
+
+        ImGui.TableNextRow();
+
+        ImGui.TableNextColumn();
+        ImGui.Text("All"u8);
+
+        ImGui.TableNextColumn();
+        using (ImRaii.Disabled(this.standardEnabled && this.rawEnabled))
+        {
+            if (ImGui.Button("Enable##all-enable"u8))
+            {
+                this.scoped ??= new();
+                if (!this.standardEnabled)
+                    this.scoped.InventoryChanged += ScopedOnInventoryChanged;
+                if (!this.rawEnabled)
+                    this.scoped.InventoryChangedRaw += ScopedOnInventoryChangedRaw;
+                this.standardEnabled = this.rawEnabled = true;
+            }
+        }
+
+        ImGui.TableNextColumn();
+        using (ImRaii.Disabled(this.scoped is null))
+        {
+            if (ImGui.Button("Disable##all-disable"u8))
+            {
+                ((IInternalDisposableService)this.scoped)?.DisposeService();
+                this.scoped = null;
+                this.standardEnabled = this.rawEnabled = false;
+            }
+        }
+    }
+
+    private static void ScopedOnInventoryChangedRaw(IReadOnlyCollection<InventoryEventArgs> events)
+    {
+        var i = 0;
+        foreach (var e in events)
+            Log.Information($"[{++i}/{events.Count}] Raw: {e}");
+    }
+
+    private static void ScopedOnInventoryChanged(IReadOnlyCollection<InventoryEventArgs> events)
+    {
+        var i = 0;
+        foreach (var e in events)
+        {
+            if (e is InventoryComplexEventArgs icea)
+                Log.Information($"[{++i}/{events.Count}] {icea}\n\t├ {icea.SourceEvent}\n\t└ {icea.TargetEvent}");
+            else
+                Log.Information($"[{++i}/{events.Count}] {e}");
+        }
+    }
+}

@@ -1,0 +1,20 @@
+namespace Dalamud.Configuration.Internal;
+
+/// <summary>
+/// Environmental configuration settings.
+/// </summary>
+internal class EnvironmentConfiguration
+{
+    /// <summary>
+    /// Gets a value indicating whether the DALAMUD_NOT_HAVE_PLUGINS setting has been enabled.
+    /// </summary>
+    public static bool DalamudNoPlugins { get; } = GetEnvironmentVariable("DALAMUD_NOT_HAVE_PLUGINS");
+
+    /// <summary>
+    /// Gets a value indicating whether the DalamudUseSafetyHook setting has been enabled.
+    /// </summary>
+    public static bool DalamudUseSafetyHook { get; } = GetEnvironmentVariable("DALAMUD_USE_SAFETYHOOK");
+
+    private static bool GetEnvironmentVariable(string name)
+        => bool.Parse(Environment.GetEnvironmentVariable(name) ?? "false");
+}

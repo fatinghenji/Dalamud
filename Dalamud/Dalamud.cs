@@ -1,812 +1,269 @@
-using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Net;
-using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using CheapLoc;
-using Dalamud.Data;
-using Dalamud.DiscordBot;
+
+using Dalamud.Common;
+using Dalamud.Configuration.Internal;
 using Dalamud.Game;
-using Dalamud.Game.Chat;
-using Dalamud.Game.Chat.SeStringHandling;
-using Dalamud.Game.ClientState;
-using Dalamud.Game.ClientState.Actors.Types;
-using Dalamud.Game.ClientState.Actors.Types.NonPlayer;
-using Dalamud.Game.Command;
-using Dalamud.Game.Internal;
-using Dalamud.Game.Internal.Gui;
-using Dalamud.Game.Network;
-using Dalamud.Interface;
-using Dalamud.Plugin;
-using ImGuiNET;
-using Lumina.Excel.GeneratedSheets;
-using Newtonsoft.Json;
+using Dalamud.Hooking.Internal.Verification;
+using Dalamud.Plugin.Internal;
+using Dalamud.Storage;
+using Dalamud.Utility;
+using Dalamud.Utility.Timing;
+
 using Serilog;
-using Serilog.Core;
-using Serilog.Events;
 
-namespace Dalamud {
-    public sealed class Dalamud : IDisposable {
-        private readonly string baseDirectory;
+using Windows.Win32.Foundation;
+using Windows.Win32.Security;
 
-        private readonly ManualResetEvent unloadSignal;
-
-        private readonly ProcessModule targetModule;
-
-        public readonly SigScanner SigScanner;
-
-        public readonly Framework Framework;
-
-        public CommandManager CommandManager { get; private set; }
-
-        public ChatHandlers ChatHandlers { get; private set; }
-
-        public NetworkHandlers NetworkHandlers { get; private set; }
-
-        public DiscordBotManager BotManager { get; private set; }
-
-        internal PluginManager PluginManager { get; private set; }
-        internal PluginRepository PluginRepository { get; private set; }
-
-        public readonly ClientState ClientState;
-
-        public readonly DalamudStartInfo StartInfo;
-        private readonly LoggingLevelSwitch loggingLevelSwitch;
-
-        internal readonly DalamudConfiguration Configuration;
-
-        private readonly WinSockHandlers WinSock2;
-
-        internal InterfaceManager InterfaceManager { get; private set; }
-
-        public DataManager Data { get; private set; }
-
-
-        internal Localization LocalizationManager;
-
-        public bool IsReady { get; private set; }
-
-        public Dalamud(DalamudStartInfo info, LoggingLevelSwitch loggingLevelSwitch) {
-            this.StartInfo = info;
-            this.loggingLevelSwitch = loggingLevelSwitch;
-
-            this.Configuration = DalamudConfiguration.Load(info.ConfigurationPath);
-
-            this.baseDirectory = info.WorkingDirectory;
-
-            this.unloadSignal = new ManualResetEvent(false);
-
-            // Initialize the process information.
-            this.targetModule = Process.GetCurrentProcess().MainModule;
-            this.SigScanner = new SigScanner(this.targetModule, true);
-
-            // Initialize game subsystem
-            this.Framework = new Framework(this.SigScanner, this);
-
-            this.ClientState = new ClientState(this, info, this.SigScanner);
-
-            this.WinSock2 = new WinSockHandlers();
-
-            AssetManager.EnsureAssets(this.baseDirectory).ContinueWith(async task => {
-                if (task.IsCanceled || task.IsFaulted) {
-                    throw new Exception("Could not ensure assets.", task.Exception);
-                }
-
-                this.LocalizationManager = new Localization(this.StartInfo.WorkingDirectory);
-                if (!string.IsNullOrEmpty(this.Configuration.LanguageOverride)) {
-                    this.LocalizationManager.SetupWithLangCode(this.Configuration.LanguageOverride);
-                } else {
-                    this.LocalizationManager.SetupWithUiCulture();
-                }
-
-                var pluginDir = this.StartInfo.PluginDirectory;
-                if (this.Configuration.DoPluginTest)
-                    pluginDir = Path.Combine(pluginDir, "..", "testPlugins");
-
-                this.PluginRepository = new PluginRepository(this, pluginDir, this.StartInfo.GameVersion);
-
-                if (Environment.GetEnvironmentVariable("DALAMUD_NOT_HAVE_INTERFACE") != "True") {
-                    try
-                    {
-                        this.InterfaceManager = new InterfaceManager(this, this.SigScanner);
-                        this.InterfaceManager.OnDraw += BuildDalamudUi;
-
-                        this.InterfaceManager.Enable();
-                    }
-                    catch (Exception e)
-                    {
-                        Log.Information(e, "Could not init interface.");
-                    }
-                }
-
-                this.Data = new DataManager(this.StartInfo.Language);
-                await this.Data.Initialize(this.baseDirectory);
-
-				// TODO: better way to do this?  basically for lumina injection
-            	SeString.Dalamud = this;
-
-                this.NetworkHandlers = new NetworkHandlers(this, this.Configuration.OptOutMbCollection);
-
-                // Initialize managers. Basically handlers for the logic
-                this.CommandManager = new CommandManager(this, info.Language);
-                SetupCommands();
-
-                this.ChatHandlers = new ChatHandlers(this);
-                // Discord Bot Manager
-                this.BotManager = new DiscordBotManager(this, this.Configuration.DiscordFeatureConfig);
-                this.BotManager.Start();
-
-                try {
-                    this.PluginManager = new PluginManager(this, pluginDir, this.StartInfo.DefaultPluginDirectory);
-                    this.PluginManager.LoadPlugins();
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "Plugin load failed.");
-                }
-
-                IsReady = true;
-            });
-        }
-
-        public void Start() {
 #if DEBUG
-            ReplaceExceptionHandler();
+[assembly: InternalsVisibleTo("Dalamud.CorePlugin")]
 #endif
 
-            this.Framework.Enable();
-            this.ClientState.Enable();
+[assembly: InternalsVisibleTo("Dalamud.Test")]
+
+namespace Dalamud;
+
+/// <summary>
+/// The main Dalamud class containing all subsystems.
+/// </summary>
+[ServiceManager.ProvidedService]
+internal sealed class Dalamud : IServiceType
+{
+    #region Internals
+
+    private static int shownServiceError = 0;
+    private readonly ManualResetEvent unloadSignal;
+
+    #endregion
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Dalamud"/> class.
+    /// </summary>
+    /// <param name="info">DalamudStartInfo instance.</param>
+    /// <param name="fs">ReliableFileStorage instance.</param>
+    /// <param name="configuration">The Dalamud configuration.</param>
+    /// <param name="mainThreadContinueEvent">Event used to signal the main thread to continue.</param>
+    public Dalamud(DalamudStartInfo info, ReliableFileStorage fs, DalamudConfiguration configuration, IntPtr mainThreadContinueEvent)
+    {
+        this.StartInfo = info;
+
+        this.unloadSignal = new ManualResetEvent(false);
+        this.unloadSignal.Reset();
+
+        // Directory resolved signatures(CS, our own) will be cached in
+        var cacheDir = new DirectoryInfo(Path.Combine(this.StartInfo.WorkingDirectory!, "cachedSigs"));
+
+        // When running sandboxed, we can't write to the working dir. Fall back to the config dir.
+        // TODO: Should this be the default?
+        try
+        {
+            if (!cacheDir.Exists)
+                cacheDir.Create();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            var configDir = Path.GetDirectoryName(this.StartInfo.ConfigurationPath!)
+                            ?? throw new DirectoryNotFoundException("Could not determine the configuration directory.");
+            var scope = new DirectoryInfo(this.StartInfo.WorkingDirectory!).Name;
+            var fallbackDir = new DirectoryInfo(Path.Combine(configDir, "cachedSigs", scope));
+
+            Log.Information(
+                "Signature cache directory {Path} is not writable, falling back to {Fallback}",
+                cacheDir.FullName,
+                fallbackDir.FullName);
+
+            cacheDir = fallbackDir;
+            if (!cacheDir.Exists)
+                cacheDir.Create();
         }
 
-        public void Unload() {
+        // Set up the SigScanner for our target module
+        TargetSigScanner scanner;
+        using (Timings.Start("SigScanner Init"))
+        {
+            scanner = new TargetSigScanner(
+                true, new FileInfo(Path.Combine(cacheDir.FullName, $"{this.StartInfo.GameVersion}.json")));
+        }
+
+        ServiceManager.InitializeProvidedServices(
+            this,
+            fs,
+            configuration,
+            scanner,
+            Localization.FromAssets(info.AssetDirectory!, configuration.LanguageOverride));
+
+        // Set up FFXIVClientStructs
+        this.SetupClientStructsResolver(cacheDir);
+
+        // Initialize global framework destroy hook
+        EntryPoint.SetupGlobalDestroyHook();
+
+        // Set up hook verification if Developer Mode is enabled. It takes a little while at the moment
+        if (configuration.DevMode == true)
+        {
+            using var t = Timings.Start("HookVerifier Init");
+            HookVerifier.Initialize();
+        }
+
+        void KickoffGameThread()
+        {
+            Log.Verbose("=============== GAME THREAD KICKOFF ===============");
+            Timings.Event("Game thread kickoff");
+            Windows.Win32.PInvoke.SetEvent(new HANDLE(mainThreadContinueEvent));
+        }
+
+        void HandleServiceInitFailure(Task t)
+        {
+            Log.Error(t.Exception!, "Service initialization failure");
+
+            if (Interlocked.CompareExchange(ref shownServiceError, 1, 0) != 0)
+                return;
+
+            ErrorHandling.ShowSystemIntegrityPolicyErrorIfApplicable(t.Exception);
+            Util.Fatal(
+                $"Dalamud failed to load all necessary services.\nThe game will continue, but you may not be able to use plugins.\n\n{t.Exception}",
+                "Dalamud", false);
+        }
+
+        ServiceManager.InitializeEarlyLoadableServices()
+                      .ContinueWith(
+                          t =>
+                          {
+                              if (t.IsCompletedSuccessfully)
+                                  return;
+
+                              HandleServiceInitFailure(t);
+                          });
+
+        ServiceManager.BlockingResolved.ContinueWith(
+            t =>
+            {
+                if (t.IsCompletedSuccessfully)
+                {
+                    KickoffGameThread();
+                    return;
+                }
+
+                HandleServiceInitFailure(t);
+            });
+
+        this.DefaultExceptionFilter = SetExceptionHandler(nint.Zero);
+        SetExceptionHandler(this.DefaultExceptionFilter);
+        Log.Debug($"SE default exception filter at {new IntPtr(this.DefaultExceptionFilter):X}");
+
+        this.DebugExceptionFilter = scanner.ScanText("40 55 53 57 48 8D AC 24 70 AD FF FF");
+        Log.Debug($"SE debug exception filter at {this.DebugExceptionFilter.ToInt64():X}");
+    }
+
+    /// <summary>
+    /// Gets the start information for this Dalamud instance.
+    /// </summary>
+    internal DalamudStartInfo StartInfo { get; private set; }
+
+    /// <summary>
+    /// Gets location of stored assets.
+    /// </summary>
+    internal DirectoryInfo AssetDirectory => new(this.StartInfo.AssetDirectory!);
+
+    /// <summary>
+    /// Gets the in-game default exception filter.
+    /// </summary>
+    private nint DefaultExceptionFilter { get; }
+
+    /// <summary>
+    /// Gets the in-game debug exception filter.
+    /// </summary>
+    private nint DebugExceptionFilter { get; }
+
+    /// <summary>
+    /// Signal to the crash handler process that we should restart the game.
+    /// </summary>
+    public static void RestartGame()
+    {
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern void RaiseException(uint dwExceptionCode, uint dwExceptionFlags, uint nNumberOfArguments, IntPtr lpArguments);
+
+        RaiseException(0x12345678, 0, 0, IntPtr.Zero);
+        Process.GetCurrentProcess().Kill();
+    }
+
+    /// <summary>
+    /// Queue an unload of Dalamud when it gets the chance.
+    /// </summary>
+    public void Unload()
+    {
+        Log.Information("Trigger unload");
+
+        var reportCrashesSetting = Service<DalamudConfiguration>.GetNullable()?.ReportShutdownCrashes ?? true;
+        var pmHasDevPlugins = Service<PluginManager>.GetNullable()?.InstalledPlugins.Any(x => x.IsDev) ?? false;
+        if (!reportCrashesSetting && !pmHasDevPlugins)
+        {
+            // Leaking on purpose for now
+            var attribs = default(SECURITY_ATTRIBUTES);
+            attribs.nLength = (uint)Unsafe.SizeOf<SECURITY_ATTRIBUTES>();
+            Windows.Win32.PInvoke.CreateMutex(attribs, false, "DALAMUD_CRASHES_NO_MORE");
+        }
+
+        Task.Run(() =>
+        {
+            ServiceManager.UnloadAllServices();
+
             this.unloadSignal.Set();
-        }
+        });
+    }
 
-        public void WaitForUnload() {
-            this.unloadSignal.WaitOne();
-        }
+    /// <summary>
+    /// Wait for an unload request to start.
+    /// </summary>
+    public void WaitForUnload()
+    {
+        this.unloadSignal.WaitOne();
+        this.unloadSignal.Dispose();
+    }
 
-        public void Dispose() {
-            // this must be done before unloading plugins, or it can cause a race condition
-            // due to rendering happening on another thread, where a plugin might receive
-            // a render call after it has been disposed, which can crash if it attempts to
-            // use any resources that it freed in its own Dispose method
-            this.InterfaceManager?.Dispose();
+    /// <summary>
+    /// Replace the current exception handler with the default one.
+    /// </summary>
+    internal void UseDefaultExceptionHandler() =>
+        SetExceptionHandler(this.DefaultExceptionFilter);
 
-            try
-            {
-                this.PluginManager.UnloadPlugins();
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, "Plugin unload failed.");
-            }
+    /// <summary>
+    /// Replace the current exception handler with a debug one.
+    /// </summary>
+    internal void UseDebugExceptionHandler() =>
+        SetExceptionHandler(this.DebugExceptionFilter);
 
-            this.Framework.Dispose();
-            this.ClientState.Dispose();
+    /// <summary>
+    /// Disable the current exception handler.
+    /// </summary>
+    internal void UseNoExceptionHandler() =>
+        SetExceptionHandler(nint.Zero);
 
-            this.BotManager.Dispose();
+    /// <summary>
+    /// Helper function to set the exception handler.
+    /// </summary>
+    private static unsafe nint SetExceptionHandler(nint newFilter)
+    {
+        var oldFilter =
+            Windows.Win32.PInvoke.SetUnhandledExceptionFilter((delegate* unmanaged[Stdcall]<global::Windows.Win32.System.Diagnostics.Debug.EXCEPTION_POINTERS*, int>)newFilter);
+        Log.Debug("Set ExceptionFilter to {0}, old: {1}", newFilter, (nint)oldFilter);
+        return (nint)oldFilter;
+    }
 
-            this.unloadSignal.Dispose();
-
-            this.WinSock2.Dispose();
-
-            this.SigScanner.Dispose();
-            
-            this.Data.Dispose();
-        }
-
-#region Interface
-
-        private bool isImguiDrawDemoWindow = false;
-
-#if DEBUG
-        private bool isImguiDrawDevMenu = true;
-#else
-        private bool isImguiDrawDevMenu = false;
-#endif
-
-        private bool isImguiDrawLogWindow = false;
-        private bool isImguiDrawDataWindow = false;
-        private bool isImguiDrawPluginWindow = false;
-        private bool isImguiDrawCreditsWindow = false;
-        private bool isImguiDrawSettingsWindow = false;
-        private bool isImguiDrawPluginStatWindow = false;
-
-        private DalamudLogWindow logWindow;
-        private DalamudDataWindow dataWindow;
-        private DalamudCreditsWindow creditsWindow;
-        private DalamudSettingsWindow settingsWindow;
-        private PluginInstallerWindow pluginWindow;
-        private DalamudPluginStatWindow pluginStatWindow;
-
-        private void BuildDalamudUi()
+    private void SetupClientStructsResolver(DirectoryInfo cacheDir)
+    {
+        using (Timings.Start("CS Resolver Init"))
         {
-            if (this.isImguiDrawDevMenu)
-            {
-                if (ImGui.BeginMainMenuBar())
-                {
-                    if (ImGui.BeginMenu("Dalamud"))
-                    {
-                        ImGui.MenuItem("Draw Dalamud dev menu", "", ref this.isImguiDrawDevMenu);
-                        ImGui.Separator();
-                        if (ImGui.MenuItem("Open Log window"))
-                        {
-                            this.logWindow = new DalamudLogWindow(CommandManager);
-                            this.isImguiDrawLogWindow = true;
-                        }
-                        if (ImGui.BeginMenu("Set log level..."))
-                        {
-                            foreach (var logLevel in Enum.GetValues(typeof(LogEventLevel)).Cast<LogEventLevel>()) {
-                                if (ImGui.MenuItem(logLevel + "##logLevelSwitch", "", this.loggingLevelSwitch.MinimumLevel == logLevel))
-                                {
-                                    this.loggingLevelSwitch.MinimumLevel = logLevel;
-                                }
-                            }
-
-                            ImGui.EndMenu();
-                        }
-                        ImGui.Separator();
-                        if (ImGui.MenuItem("Open Data window"))
-                        {
-                            this.dataWindow = new DalamudDataWindow(this);
-                            this.isImguiDrawDataWindow = true;
-                        }
-                        if (ImGui.MenuItem("Open Credits window")) {
-                            OnOpenCreditsCommand(null, null);
-                        }
-                        if (ImGui.MenuItem("Open Settings window"))
-                        {
-                            OnOpenSettingsCommand(null, null);
-                        }
-                        ImGui.MenuItem("Draw ImGui demo", "", ref this.isImguiDrawDemoWindow);
-                        if (ImGui.MenuItem("Dump ImGui info"))
-                            OnDebugImInfoCommand(null, null);
-                        ImGui.Separator();
-                        if (ImGui.MenuItem("Unload Dalamud"))
-                        {
-                            Unload();
-                        }
-                        if (ImGui.MenuItem("Kill game"))
-                        {
-                            Process.GetCurrentProcess().Kill();
-                        }
-                        if (ImGui.MenuItem("Cause AccessViolation")) {
-                            var a = Marshal.ReadByte(IntPtr.Zero);
-                        }
-                        ImGui.Separator();
-                        ImGui.MenuItem(Util.AssemblyVersion, false);
-                        ImGui.MenuItem(this.StartInfo.GameVersion, false);
-
-                        ImGui.EndMenu();
-                    }
-
-                    if (ImGui.BeginMenu("Game")) {
-                        if (ImGui.MenuItem("Replace ExceptionHandler")) {
-                            ReplaceExceptionHandler();
-                        }
-
-                        ImGui.EndMenu();
-                    }
-
-                    if (ImGui.BeginMenu("Plugins"))
-                    {
-                        if (ImGui.MenuItem("Open Plugin installer"))
-                        {
-                            this.pluginWindow = new PluginInstallerWindow(this, this.StartInfo.GameVersion);
-                            this.isImguiDrawPluginWindow = true;
-                        }
-                        if (ImGui.MenuItem("Open Plugin Stats")) {
-                            if (!this.isImguiDrawPluginStatWindow) {
-                                this.pluginStatWindow = new DalamudPluginStatWindow(this.PluginManager);
-                                this.isImguiDrawPluginStatWindow = true;
-                            }
-                        }
-                        if (ImGui.MenuItem("Print plugin info")) {
-                            foreach (var plugin in this.PluginManager.Plugins) {
-                                // TODO: some more here, state maybe?
-                                Log.Information($"{plugin.Plugin.Name}");
-                            }
-                        }
-                        if (ImGui.MenuItem("Reload plugins"))
-                        {
-                            OnPluginReloadCommand(string.Empty, string.Empty);
-                        }
-
-                        ImGui.Separator();
-                        ImGui.MenuItem("API Level:" + PluginManager.DALAMUD_API_LEVEL, false);
-                        ImGui.MenuItem("Loaded plugins:" + PluginManager?.Plugins.Count, false);
-                        ImGui.EndMenu();
-                    } 
-
-                    if (ImGui.BeginMenu("Localization"))
-                    {
-                        if (ImGui.MenuItem("Export localizable"))
-                        {
-                            Loc.ExportLocalizable();
-                        }
-
-                        if (ImGui.BeginMenu("Load language..."))
-                        {
-                            if (ImGui.MenuItem("From Fallbacks"))
-                            {
-                                Loc.SetupWithFallbacks();
-                            }
-
-                            if (ImGui.MenuItem("From UICulture")) {
-                                this.LocalizationManager.SetupWithUiCulture();
-                            }
-
-                            foreach (var applicableLangCode in Localization.ApplicableLangCodes) {
-                                if (ImGui.MenuItem($"Applicable: {applicableLangCode}"))
-                                {
-                                    this.LocalizationManager.SetupWithLangCode(applicableLangCode);
-                                }
-                            }
-
-                            ImGui.EndMenu();
-                        }
-                        ImGui.EndMenu();
-                    }
-
-                    ImGui.EndMainMenuBar();
-                }
-            }
-
-            if (this.isImguiDrawLogWindow)
-            {
-                this.isImguiDrawLogWindow = this.logWindow != null && this.logWindow.Draw();
-
-                if (this.isImguiDrawLogWindow == false)
-                {
-                    this.logWindow?.Dispose();
-                    this.logWindow = null;
-                }
-            }
-
-            if (this.isImguiDrawDataWindow)
-            {
-                this.isImguiDrawDataWindow = this.dataWindow != null && this.dataWindow.Draw();
-            }
-
-            if (this.isImguiDrawPluginWindow)
-            {
-                this.isImguiDrawPluginWindow = this.pluginWindow != null && this.pluginWindow.Draw();
-            }
-
-            if (this.isImguiDrawItemSearchWindow)
-            {
-                this.isImguiDrawItemSearchWindow = this.itemSearchCommandWindow != null && this.itemSearchCommandWindow.Draw();
-
-                if (this.isImguiDrawItemSearchWindow == false)
-                {
-                    this.itemSearchCommandWindow?.Dispose();
-                    this.itemSearchCommandWindow = null;
-                }
-            }
-
-            if (this.isImguiDrawCreditsWindow)
-            {
-                this.isImguiDrawCreditsWindow = this.creditsWindow != null && this.creditsWindow.Draw();
-
-                if (this.isImguiDrawCreditsWindow == false)
-                {
-                    this.creditsWindow?.Dispose();
-                    this.creditsWindow = null;
-                }
-            }
-
-            if (this.isImguiDrawSettingsWindow)
-            {
-                this.isImguiDrawSettingsWindow = this.settingsWindow != null && this.settingsWindow.Draw();
-            }
-
-            if (this.isImguiDrawDemoWindow)
-                ImGui.ShowDemoWindow();
-
-            if (this.isImguiDrawPluginStatWindow) {
-                this.isImguiDrawPluginStatWindow = this.pluginStatWindow != null && this.pluginStatWindow.Draw();
-                if (!this.isImguiDrawPluginStatWindow) {
-                    this.pluginStatWindow?.Dispose();
-                    this.pluginStatWindow = null;
-                }
-            }
+            // the resolver tracks version as a field in the json
+            InteropGenerator.Runtime.Resolver.GetInstance.Setup(Service<TargetSigScanner>.Get().SearchBase, $"{this.StartInfo.GameVersion}", new FileInfo(Path.Combine(cacheDir.FullName, "cs.json")));
+            FFXIVClientStructs.Interop.Generated.Addresses.Register();
+            InteropGenerator.Runtime.Resolver.GetInstance.Resolve();
         }
-
-        private void ReplaceExceptionHandler() {
-            var semd = this.SigScanner.ScanText(
-                "40 55 53 56 48 8D AC 24 ?? ?? ?? ?? B8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 2B E0 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 ?? ?? ?? ?? 48 83 3D ?? ?? ?? ?? ??");
-            Log.Debug($"SE debug filter at {semd.ToInt64():X}");
-
-            var oldFilter = NativeFunctions.SetUnhandledExceptionFilter(semd);
-            Log.Debug("Reset ExceptionFilter, old: {0}", oldFilter);
-        }
-
-#endregion
-
-        private void SetupCommands() {
-            CommandManager.AddHandler("/xldclose", new CommandInfo(OnUnloadCommand) {
-                HelpMessage = Loc.Localize("DalamudUnloadHelp", "Unloads XIVLauncher in-game addon."),
-                ShowInHelp = false
-            });
-
-            CommandManager.AddHandler("/xldreloadplugins", new CommandInfo(OnPluginReloadCommand) {
-                HelpMessage = Loc.Localize("DalamudPluginReloadHelp", "Reloads all plugins."),
-                                           ShowInHelp = false
-            });
-
-            CommandManager.AddHandler("/xldsay", new CommandInfo(OnCommandDebugSay) {
-                HelpMessage = Loc.Localize("DalamudPrintChatHelp", "Print to chat."),
-                                           ShowInHelp = false
-            });
-
-            CommandManager.AddHandler("/xlhelp", new CommandInfo(OnHelpCommand) {
-                HelpMessage = Loc.Localize("DalamudCmdInfoHelp", "Shows list of commands available.")
-            });
-
-            CommandManager.AddHandler("/xlmute", new CommandInfo(OnBadWordsAddCommand) {
-                HelpMessage = Loc.Localize("DalamudMuteHelp", "Mute a word or sentence from appearing in chat. Usage: /xlmute <word or sentence>")
-            });
-
-            CommandManager.AddHandler("/xlmutelist", new CommandInfo(OnBadWordsListCommand) {
-                HelpMessage = Loc.Localize("DalamudMuteListHelp", "List muted words or sentences.")
-            });
-
-            CommandManager.AddHandler("/xlunmute", new CommandInfo(OnBadWordsRemoveCommand) {
-                HelpMessage = Loc.Localize("DalamudUnmuteHelp", "Unmute a word or sentence. Usage: /xlunmute <word or sentence>")
-            });
-
-            CommandManager.AddHandler("/ll", new CommandInfo(OnLastLinkCommand) {
-                HelpMessage = Loc.Localize("DalamudLastLinkHelp", "Open the last posted link in your default browser.")
-            });
-
-            CommandManager.AddHandler("/xlbotjoin", new CommandInfo(OnBotJoinCommand) {
-                HelpMessage = Loc.Localize("DalamudBotJoinHelp", "Add the XIVLauncher discord bot you set up to your server.")
-            });
-
-            CommandManager.AddHandler("/xlbgmset", new CommandInfo(OnBgmSetCommand)
-            {
-                HelpMessage = Loc.Localize("DalamudBgmSetHelp", "Set the Game background music. Usage: /xlbgmset <BGM ID>")
-            });
-
-            CommandManager.AddHandler("/xlitem", new CommandInfo(OnItemLinkCommand)
-            {
-                HelpMessage = Loc.Localize("DalamudItemLinkHelp", "Open a window you can use to link any specific item to chat.")
-            });
-
-#if DEBUG
-            CommandManager.AddHandler("/xldzpi", new CommandInfo(OnDebugZoneDownInjectCommand)
-            {
-                HelpMessage = "Inject zone down channel",
-                ShowInHelp = false
-            });
-#endif
-
-            CommandManager.AddHandler("/xlbonus", new CommandInfo(OnRouletteBonusNotifyCommand)
-            {
-                HelpMessage = Loc.Localize("DalamudBonusHelp", "Notify when a roulette has a bonus you specified. Run without parameters for more info. Usage: /xlbonus <roulette name> <role name>")
-            });
-
-            CommandManager.AddHandler("/xldev", new CommandInfo(OnDebugDrawDevMenu) {
-                HelpMessage = Loc.Localize("DalamudDevMenuHelp", "Draw dev menu DEBUG"),
-                                           ShowInHelp = false
-            });
-
-            CommandManager.AddHandler("/xlplugins", new CommandInfo(OnOpenInstallerCommand)
-            {
-                HelpMessage = Loc.Localize("DalamudInstallerHelp", "Open the plugin installer")
-            });
-
-            this.CommandManager.AddHandler("/xlcredits", new CommandInfo(OnOpenCreditsCommand) {
-                HelpMessage = Loc.Localize("DalamudCreditsHelp", "Opens the credits for dalamud.")
-            });
-
-            this.CommandManager.AddHandler("/xllanguage", new CommandInfo(OnSetLanguageCommand)
-            {
-                HelpMessage = Loc.Localize("DalamudLanguageHelp", "Set the language for the in-game addon and plugins that support it. Available languages: ") + Localization.ApplicableLangCodes.Aggregate("en", (current, code) => current + ", " + code)
-            });
-
-            this.CommandManager.AddHandler("/xlsettings", new CommandInfo(OnOpenSettingsCommand)
-            {
-                HelpMessage = Loc.Localize("DalamudSettingsHelp", "Change various In-Game-Addon settings like chat channels and the discord bot setup.")
-            });
-
-            this.CommandManager.AddHandler("/xlbugreport", new CommandInfo(OnBugReportCommand)
-            {
-                HelpMessage = Loc.Localize("DalamudBugReport", "Upload a log to be analyzed by our professional development team."),
-                ShowInHelp = false
-            });
-
-
-            this.CommandManager.AddHandler("/imdebug", new CommandInfo(OnDebugImInfoCommand)
-            {
-                HelpMessage = "ImGui DEBUG",
-                ShowInHelp = false
-            });
-        }
-
-        private void OnUnloadCommand(string command, string arguments) {
-            Framework.Gui.Chat.Print("Unloading...");
-            Unload();
-        }
-
-        private void OnHelpCommand(string command, string arguments) {
-            var showDebug = arguments.Contains("debug");
-
-            Framework.Gui.Chat.Print(Loc.Localize("DalamudCmdHelpAvailable", "Available commands:"));
-            foreach (var cmd in CommandManager.Commands) {
-                if (!cmd.Value.ShowInHelp && !showDebug)
-                    continue;
-
-                Framework.Gui.Chat.Print($"{cmd.Key}: {cmd.Value.HelpMessage}");
-            }
-        }
-
-        private void OnCommandDebugSay(string command, string arguments) {
-            var parts = arguments.Split();
-
-            var chatType = (XivChatType) int.Parse(parts[0]);
-            var msg = string.Join(" ", parts.Take(1).ToArray());
-
-            Framework.Gui.Chat.PrintChat(new XivChatEntry {
-                MessageBytes = Encoding.UTF8.GetBytes(msg),
-                Name = "Xiv Launcher",
-                Type = chatType
-            });
-        }
-
-        private void OnPluginReloadCommand(string command, string arguments) {
-            Framework.Gui.Chat.Print("Reloading...");
-
-            try {
-                this.PluginManager.UnloadPlugins();
-                this.PluginManager.LoadPlugins();
-
-                Framework.Gui.Chat.Print("OK");
-            } catch (Exception ex) {
-                Framework.Gui.Chat.PrintError("Reload failed.");
-                Log.Error(ex, "Plugin reload failed.");
-            }
-        }
-
-        private void OnBadWordsAddCommand(string command, string arguments) {
-            if (this.Configuration.BadWords == null)
-                this.Configuration.BadWords = new List<string>();
-
-            if (string.IsNullOrEmpty(arguments)) {
-                Framework.Gui.Chat.Print(Loc.Localize("DalamudMuteNoArgs", "Please provide a word to mute."));
-                return;
-            }
-
-            this.Configuration.BadWords.Add(arguments);
-
-            this.Configuration.Save();
-
-            Framework.Gui.Chat.Print(string.Format(Loc.Localize("DalamudMuted", "Muted \"{0}\"."), arguments));
-        }
-
-        private void OnBadWordsListCommand(string command, string arguments) {
-            if (this.Configuration.BadWords == null)
-                this.Configuration.BadWords = new List<string>();
-
-            if (this.Configuration.BadWords.Count == 0) {
-                Framework.Gui.Chat.Print(Loc.Localize("DalamudNoneMuted", "No muted words or sentences."));
-                return;
-            }
-
-            this.Configuration.Save();
-
-            foreach (var word in this.Configuration.BadWords) Framework.Gui.Chat.Print($"\"{word}\"");
-        }
-
-        private void OnBadWordsRemoveCommand(string command, string arguments) {
-            if (this.Configuration.BadWords == null)
-                this.Configuration.BadWords = new List<string>();
-
-            this.Configuration.BadWords.RemoveAll(x => x == arguments);
-
-            this.Configuration.Save();
-
-            Framework.Gui.Chat.Print(string.Format(Loc.Localize("DalamudUnmuted", "Unmuted \"{0}\"."), arguments));
-        }
-
-        private void OnLastLinkCommand(string command, string arguments) {
-            if (string.IsNullOrEmpty(ChatHandlers.LastLink)) {
-                Framework.Gui.Chat.Print(Loc.Localize("DalamudNoLastLink", "No last link..."));
-                return;
-            }
-
-            Framework.Gui.Chat.Print(string.Format(Loc.Localize("DalamudOpeningLink", "Opening {0}"), ChatHandlers.LastLink));
-            Process.Start(ChatHandlers.LastLink);
-        }
-
-        private void OnBotJoinCommand(string command, string arguments) {
-            if (this.BotManager != null && this.BotManager.IsConnected)
-                Process.Start(
-                    $"https://discordapp.com/oauth2/authorize?client_id={this.BotManager.UserId}&scope=bot&permissions=117760");
-            else
-                Framework.Gui.Chat.Print(
-                    Loc.Localize("DalamudBotNotSetup", "The XIVLauncher discord bot was not set up correctly or could not connect to discord. Please check the settings and the FAQ."));
-        }
-
-        private void OnBgmSetCommand(string command, string arguments)
-        {
-            Framework.Gui.SetBgm(ushort.Parse(arguments));
-        }
-
-        private ItemSearchWindow itemSearchCommandWindow;
-        private bool isImguiDrawItemSearchWindow;
-
-        private void OnItemLinkCommand(string command, string arguments)
-        {
-            this.itemSearchCommandWindow = new ItemSearchWindow(this.Data, new UiBuilder(this.InterfaceManager, "ItemSearcher"), false, arguments);
-            this.itemSearchCommandWindow.OnItemChosen += (sender, item) =>
-            {
-                this.Framework.Gui.Chat.PrintChat(new XivChatEntry
-                {
-                    MessageBytes = SeStringUtils.CreateItemLink(item, false).Encode()
-                });
-            };
-            this.isImguiDrawItemSearchWindow = true;
-        }
-
-#if DEBUG
-        private void OnDebugZoneDownInjectCommand(string command, string arguments) {
-            var data = File.ReadAllBytes(arguments);
-
-            Framework.Network.InjectZoneProtoPacket(data);
-            Framework.Gui.Chat.Print($"{arguments} OK with {data.Length} bytes");
-        }
-#endif
-
-        private void OnRouletteBonusNotifyCommand(string command, string arguments)
-        {
-            if (this.Configuration.DiscordFeatureConfig.CfPreferredRoleChannel == null)
-                Framework.Gui.Chat.PrintError(Loc.Localize("DalamudChannelNotSetup", "You have not set up a discord channel for these notifications - you will only receive them in chat. To do this, please use the XIVLauncher in-game settings."));
-
-            if (string.IsNullOrEmpty(arguments))
-                goto InvalidArgs;
-
-            var argParts = arguments.Split();
-            if (argParts.Length < 2)
-                goto InvalidArgs;
-
-
-            if (this.Configuration.PreferredRoleReminders == null)
-                this.Configuration.PreferredRoleReminders = new Dictionary<int, DalamudConfiguration.PreferredRole>();
-
-            var rouletteIndex = RouletteSlugToKey(argParts[0]);
-
-            if (rouletteIndex == 0)
-                goto InvalidArgs;
-
-            if (!Enum.TryParse(argParts[1].First().ToString().ToUpper() + argParts[1].ToLower().Substring(1), out DalamudConfiguration.PreferredRole role))
-                goto InvalidArgs;
-
-            if (this.Configuration.PreferredRoleReminders.ContainsKey(rouletteIndex))
-                this.Configuration.PreferredRoleReminders[rouletteIndex] = role;
-            else
-                this.Configuration.PreferredRoleReminders.Add(rouletteIndex, role);
-
-            this.Framework.Gui.Chat.Print($"Set bonus notifications for {argParts[0]}({rouletteIndex}) to {role}");
-            this.Framework.Gui.Chat.Print(string.Format(Loc.Localize("DalamudBonusSet", "Set bonus notifications for {0}({1}) to {2}"), argParts[0], rouletteIndex, role));
-            this.Configuration.Save();
-
-            return;
-
-            InvalidArgs:
-            this.Framework.Gui.Chat.PrintError(Loc.Localize("DalamudInvalidArguments", "Unrecognized arguments."));
-            this.Framework.Gui.Chat.Print(Loc.Localize("DalamudBonusPossibleValues", "Possible values for roulette: leveling, 506070, msq, guildhests, expert, trials, mentor, alliance, normal\nPossible values for role: tank, dps, healer, all, none/reset"));
-        }
-
-        private void OnDebugDrawDevMenu(string command, string arguments) {
-            this.isImguiDrawDevMenu = true;
-        }
-
-        private void OnDebugImInfoCommand(string command, string arguments) {
-            var io = this.InterfaceManager.LastImGuiIoPtr;
-            var info = $"WantCaptureKeyboard: {io.WantCaptureKeyboard}\n";
-            info += $"WantCaptureMouse: {io.WantCaptureMouse}\n";
-            info += $"WantSetMousePos: {io.WantSetMousePos}\n";
-            info += $"WantTextInput: {io.WantTextInput}\n";
-            info += $"WantSaveIniSettings: {io.WantSaveIniSettings}\n"; 
-            info += $"BackendFlags: {(int) io.BackendFlags}\n";
-            info += $"DeltaTime: {io.DeltaTime}\n";
-            info += $"DisplaySize: {io.DisplaySize.X} {io.DisplaySize.Y}\n";
-            info += $"Framerate: {io.Framerate}\n";
-            info += $"MetricsActiveWindows: {io.MetricsActiveWindows}\n";
-            info += $"MetricsRenderWindows: {io.MetricsRenderWindows}\n";
-            info += $"MousePos: {io.MousePos.X} {io.MousePos.Y}\n";
-            info += $"MouseClicked: {io.MouseClicked}\n";
-            info += $"MouseDown: {io.MouseDown}\n";
-            info += $"NavActive: {io.NavActive}\n";
-            info += $"NavVisible: {io.NavVisible}\n";
-
-            Log.Information(info);
-        }
-
-        private void OnOpenInstallerCommand(string command, string arguments) {
-            this.pluginWindow = new PluginInstallerWindow(this, this.StartInfo.GameVersion);
-            this.isImguiDrawPluginWindow = true;
-        }
-
-        private void OnOpenCreditsCommand(string command, string arguments)
-        {
-            var logoGraphic =
-                this.InterfaceManager.LoadImage(
-                    Path.Combine(this.StartInfo.WorkingDirectory, "UIRes", "logo.png"));
-            this.creditsWindow = new DalamudCreditsWindow(this, logoGraphic, this.Framework);
-            this.isImguiDrawCreditsWindow = true;
-        }
-
-        private void OnSetLanguageCommand(string command, string arguments)
-        {
-            if (Localization.ApplicableLangCodes.Contains(arguments.ToLower())) {
-                this.LocalizationManager.SetupWithLangCode(arguments.ToLower());
-                this.Configuration.LanguageOverride = arguments.ToLower();
-
-                this.Framework.Gui.Chat.Print(string.Format(Loc.Localize("DalamudLanguageSetTo", "Language set to {0}"), arguments));
-            } else {
-                this.LocalizationManager.SetupWithUiCulture();
-                this.Configuration.LanguageOverride = null;
-
-                this.Framework.Gui.Chat.Print(string.Format(Loc.Localize("DalamudLanguageSetTo", "Language set to {0}"), "default"));
-            }
-
-            this.Configuration.Save();
-        }
-
-        private void OnOpenSettingsCommand(string command, string arguments)
-        {
-            this.settingsWindow = new DalamudSettingsWindow(this);
-            this.isImguiDrawSettingsWindow = true;
-        }
-
-        private void OnBugReportCommand(string command, string arguments) {
-            Task.Run(() => {
-                try {
-                    using var file = new FileStream(Path.Combine(this.StartInfo.WorkingDirectory, "dalamud.txt"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                    using var reader = new StreamReader(file, Encoding.UTF8);
-
-                    using var client = new WebClient();
-                    var response = client.UploadString("https://dalamud-bugbait.herokuapp.com/catch", reader.ReadToEnd());
-
-                    this.Framework.Gui.Chat.PrintError(
-                        "Your bug report was submitted. A certified technical support specialist will be with you shortly. Please tell them this number: " +
-                        response);
-                } catch (Exception ex) {
-                    Log.Error(ex, "Bug report failed.");
-                    this.Framework.Gui.Chat.PrintError("Could not submit bug report");
-                }
-            });
-        }
-
-        private int RouletteSlugToKey(string slug) => slug.ToLower() switch {
-            "leveling" => 1,
-            "506070" => 2,
-            "msq" => 3,
-            "guildhests" => 4,
-            "expert" => 5,
-            "trials" => 6,
-            "mentor" => 8,
-            "alliance" => 9,
-            "normal" => 10,
-            _ => 0
-        };
-
-        private DalamudConfiguration.PreferredRole RoleNameToPreferredRole(string name) => name.ToLower() switch
-        {
-            "Tank" => DalamudConfiguration.PreferredRole.Tank,
-            "Healer" => DalamudConfiguration.PreferredRole.Healer,
-            "Dps" => DalamudConfiguration.PreferredRole.Dps,
-            "All" => DalamudConfiguration.PreferredRole.All,
-            _ => DalamudConfiguration.PreferredRole.None
-        };
     }
 }

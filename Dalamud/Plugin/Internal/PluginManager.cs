@@ -1,0 +1,1973 @@
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+
+using CheapLoc;
+
+using Dalamud.Configuration;
+using Dalamud.Configuration.Internal;
+using Dalamud.Game;
+using Dalamud.Game.Gui;
+using Dalamud.Game.Text;
+using Dalamud.Game.Text.SeStringHandling;
+using Dalamud.Game.Text.SeStringHandling.Payloads;
+using Dalamud.Interface;
+using Dalamud.Interface.Internal;
+using Dalamud.IoC;
+using Dalamud.Logging.Internal;
+using Dalamud.Networking.Http;
+using Dalamud.Plugin.Internal.Exceptions;
+using Dalamud.Plugin.Internal.Profiles;
+using Dalamud.Plugin.Internal.Types;
+using Dalamud.Plugin.Internal.Types.Manifest;
+using Dalamud.Plugin.Ipc.Internal;
+using Dalamud.Support;
+using Dalamud.Utility;
+using Dalamud.Utility.Timing;
+
+using Newtonsoft.Json;
+
+namespace Dalamud.Plugin.Internal;
+
+/// <summary>
+/// Class responsible for loading and unloading plugins.
+/// NOTE: ALL plugin exposed services are marked as dependencies for <see cref="PluginManager"/>
+/// from <see cref="ResolvePossiblePluginDependencyServices"/>.
+/// </summary>
+[ServiceManager.BlockingEarlyLoadedService("Accommodation of plugins that blocks the game startup.")]
+internal class PluginManager : IInternalDisposableService
+{
+    /// <summary>
+    /// Default time to wait between plugin unload and plugin assembly unload.
+    /// </summary>
+    public const int PluginWaitBeforeFreeDefault = 1000; // upped from 500ms, seems more stable
+
+    private const string BrokenMarkerFileName = ".broken";
+
+    private static readonly ModuleLog Log = ModuleLog.Create<PluginManager>();
+
+    private readonly Lock pluginListLock = new();
+    private readonly DirectoryInfo pluginDirectory;
+    private readonly BannedPlugin[]? bannedPlugins;
+
+    private readonly List<LocalPlugin> installedPluginsList = [];
+    private readonly List<RemotePluginManifest> availablePluginsList = [];
+    private readonly List<AvailablePluginUpdate> updatablePluginsList = [];
+
+    private readonly Task<DalamudLinkPayload> openInstallerWindowPluginChangelogsLink;
+
+    [ServiceManager.ServiceDependency]
+    private readonly DalamudConfiguration configuration = Service<DalamudConfiguration>.Get();
+
+    [ServiceManager.ServiceDependency]
+    private readonly Dalamud dalamud = Service<Dalamud>.Get();
+
+    [ServiceManager.ServiceDependency]
+    private readonly ProfileManager profileManager = Service<ProfileManager>.Get();
+
+    [ServiceManager.ServiceDependency]
+    private readonly HappyHttpClient happyHttpClient = Service<HappyHttpClient>.Get();
+
+    private Task? repoRefreshTask;
+
+    static PluginManager()
+    {
+        DalamudApiLevel = typeof(PluginManager).Assembly.GetName().Version!.Major;
+    }
+
+    [ServiceManager.ServiceConstructor]
+    private PluginManager(
+        ServiceManager.RegisterStartupBlockerDelegate registerStartupBlocker,
+        ServiceManager.RegisterUnloadAfterDelegate registerUnloadAfter)
+    {
+        this.pluginDirectory = new DirectoryInfo(this.dalamud.StartInfo.PluginDirectory!);
+
+        if (!this.pluginDirectory.Exists)
+            this.pluginDirectory.Create();
+
+        this.SafeMode = EnvironmentConfiguration.DalamudNoPlugins || this.configuration.PluginSafeMode || this.dalamud.StartInfo.NoLoadPlugins;
+
+        try
+        {
+            var appdata = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            var safeModeFile = Path.Combine(appdata, "XIVLauncher", ".dalamud_safemode");
+
+            if (File.Exists(safeModeFile))
+            {
+                this.SafeMode = true;
+                File.Delete(safeModeFile);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Couldn't check safe mode file");
+        }
+
+        if (this.SafeMode)
+        {
+            this.configuration.PluginSafeMode = false;
+            this.configuration.QueueSave();
+        }
+
+        this.PluginConfigs = new PluginConfigurations(Path.Combine(Path.GetDirectoryName(this.dalamud.StartInfo.ConfigurationPath) ?? string.Empty, "pluginConfigs"));
+
+        var bannedPluginsJson = File.ReadAllText(Path.Combine(this.dalamud.StartInfo.AssetDirectory!, "UIRes", "bannedplugin.json"));
+        this.bannedPlugins = JsonConvert.DeserializeObject<BannedPlugin[]>(bannedPluginsJson)
+            ?? throw new InvalidDataException("Couldn't deserialize banned plugins manifest.");
+        this.openInstallerWindowPluginChangelogsLink =
+            Service<ChatGui>.GetAsync().ContinueWith(
+                chatGuiTask => chatGuiTask.Result.AddChatLinkHandler(
+                    (_, _) =>
+                    {
+                        Service<DalamudInterface>.GetNullable()?.OpenPluginInstallerTo(
+                            PluginInstallerOpenKind.Changelogs);
+                    }));
+
+        this.configuration.PluginTestingOptIns ??= [];
+        this.MainRepo = PluginRepository.CreateMainRepo(this.happyHttpClient);
+
+        registerStartupBlocker(
+            Task.Run(this.LoadAndStartLoadSyncPlugins),
+            "Waiting for plugins that asked to be loaded before the game.");
+
+        registerUnloadAfter(
+            ResolvePossiblePluginDependencyServices(),
+            "See the attached comment for the called function.");
+    }
+
+    /// <summary>
+    /// An event that fires when the installed plugins have changed.
+    /// </summary>
+    public event Action? OnInstalledPluginsChanged;
+
+    /// <summary>
+    /// An event that fires when the available plugins have changed.
+    /// </summary>
+    public event Action? OnAvailablePluginsChanged;
+
+    /// <summary>
+    /// Gets the current Dalamud API level, used to handle breaking changes. Only plugins with this level will be loaded.
+    /// As of Dalamud 9.x, this always matches the major version number of Dalamud.
+    /// </summary>
+    public static int DalamudApiLevel { get; private set; }
+
+    /// <summary>
+    /// Gets the number of loaded plugins.
+    /// </summary>
+    public int LoadedPluginCount
+    {
+        get
+        {
+            var res = 0;
+            using (this.pluginListLock.EnterScope())
+            {
+                foreach (var p in this.installedPluginsList)
+                {
+                    if (p.State == PluginState.Loaded)
+                        res++;
+                }
+            }
+
+            return res;
+        }
+    }
+
+    /// <summary>
+    /// Gets a copy of the list of all loaded plugins.
+    /// </summary>
+    public IEnumerable<LocalPlugin> InstalledPlugins
+    {
+        get
+        {
+            using (this.pluginListLock.EnterScope())
+                return this.installedPluginsList.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Gets a copy of the list of all available plugins.
+    /// </summary>
+    public IEnumerable<RemotePluginManifest> AvailablePlugins
+    {
+        get
+        {
+            using (this.pluginListLock.EnterScope())
+                return this.availablePluginsList.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Gets a copy of the list of all plugins with an available update.
+    /// </summary>
+    public IEnumerable<AvailablePluginUpdate> UpdatablePlugins
+    {
+        get
+        {
+            using (this.pluginListLock.EnterScope())
+                return this.updatablePluginsList.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Gets the main repository.
+    /// </summary>
+    public PluginRepository MainRepo { get; }
+
+    /// <summary>
+    /// Gets a list of all plugin repositories. The main repo should always be first.
+    /// </summary>
+    public List<PluginRepository> Repos { get; private set; } = [];
+
+    /// <summary>
+    /// Gets a value indicating whether plugins are not still loading from boot.
+    /// </summary>
+    public bool PluginsReady { get; private set; }
+
+    /// <summary>
+    /// Gets a value indicating whether all added repos are not in progress.
+    /// </summary>
+    public bool ReposReady => this.repoRefreshTask is { IsCompleted: true };
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the plugin manager started in safe mode.
+    /// </summary>
+    public bool SafeMode { get; set; }
+
+    /// <summary>
+    /// Gets the <see cref="PluginConfigurations"/> object used when initializing plugins.
+    /// </summary>
+    public PluginConfigurations PluginConfigs { get; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether banned plugins will be loaded.
+    /// </summary>
+    public bool LoadBannedPlugins { get; set; }
+
+    /// <summary>
+    /// Gets a tracker for plugins that are loading at startup, used to display information to the user.
+    /// </summary>
+    public StartupLoadTracker? StartupLoadTracking { get; private set; }
+
+    /// <summary>
+    /// Gets a value indicating whether the given repo manifest should be visible to the user.
+    /// </summary>
+    /// <param name="manifest">Repo manifest.</param>
+    /// <returns>If the manifest is visible.</returns>
+    public static bool IsManifestVisible(RemotePluginManifest manifest)
+    {
+        // Hidden by manifest
+        return !manifest.IsHide;
+    }
+
+    /// <summary>
+    /// Get a disposable that will lock plugin lists while it is not disposed.
+    /// You must NEVER use this in async code.
+    /// </summary>
+    /// <returns>The aforementioned disposable.</returns>
+    public Lock.Scope GetSyncScope() => this.pluginListLock.EnterScope();
+
+    /// <summary>
+    /// Print to chat any plugin updates and whether they were successful.
+    /// </summary>
+    /// <param name="updateMetadata">The list of updated plugin metadata.</param>
+    /// <param name="header">The header text to send to chat prior to any update info.</param>
+    public void PrintUpdatedPlugins(List<PluginUpdateStatus>? updateMetadata, string header)
+        => Service<ChatGui>.GetAsync().ContinueWith(
+            chatGuiTask =>
+            {
+                if (!chatGuiTask.IsCompletedSuccessfully)
+                    return;
+
+                var chatGui = chatGuiTask.Result;
+                if (updateMetadata is { Count: > 0 })
+                {
+                    chatGui.Print(
+                        new XivChatEntry
+                        {
+                            Message = new SeString(
+                                new List<Payload>()
+                                {
+                                    new TextPayload(header),
+                                    new TextPayload("  ["),
+                                    new UIForegroundPayload(500),
+                                    this.openInstallerWindowPluginChangelogsLink.Result,
+                                    new TextPayload(
+                                        Loc.Localize("DalamudInstallerPluginChangelogHelp", "Open plugin changelogs")),
+                                    RawPayload.LinkTerminator,
+                                    new UIForegroundPayload(0),
+                                    new TextPayload("]"),
+                                }),
+                            Type = this.configuration.GeneralChatType,
+                        });
+
+                    foreach (var metadata in updateMetadata)
+                    {
+                        if (metadata.Status == PluginUpdateStatus.StatusKind.Success)
+                        {
+                            chatGui.Print(Locs.DalamudPluginUpdateSuccessful(metadata.AffectedPlugin.Name, metadata.AffectedPlugin.Version));
+                        }
+                        else
+                        {
+                            chatGui.Print(
+                                new XivChatEntry
+                                {
+                                    Message = Locs.DalamudPluginUpdateFailed(
+                                        metadata.AffectedPlugin.Name,
+                                        metadata.AffectedPlugin.Version,
+                                        PluginUpdateStatus.LocalizeUpdateStatusKind(metadata.Status)),
+                                    Type = XivChatType.Urgent,
+                                });
+                        }
+                    }
+                }
+            });
+
+    /// <summary>
+    /// For a given manifest, determine if the user opted into testing this plugin.
+    /// </summary>
+    /// <param name="manifest">Manifest to check.</param>
+    /// <returns>A value indicating whether testing should be used.</returns>
+    public bool HasTestingOptIn(IPluginManifest manifest)
+    {
+        return this.configuration.PluginTestingOptIns!.Any(x => x.InternalName == manifest.InternalName);
+    }
+
+    /// <summary>
+    /// For a given manifest, determine if the testing version can be used over the normal version.
+    /// The higher of the two versions is calculated after checking other settings.
+    /// </summary>
+    /// <param name="manifest">Manifest to check.</param>
+    /// <returns>A value indicating whether testing can be used.</returns>
+    public bool CanUseTesting(RemotePluginManifest manifest)
+    {
+        if (!this.configuration.DoPluginTest)
+            return false;
+
+        if (!manifest.TestingDalamudApiLevel.HasValue)
+            return false;
+
+        return manifest.IsTestingExclusive || manifest.IsAvailableForTesting;
+    }
+
+    /// <summary>
+    /// For a given manifest, determine if the testing version should be used over the normal version.
+    /// The higher of the two versions is calculated after checking other settings.
+    /// </summary>
+    /// <param name="manifest">Manifest to check.</param>
+    /// <returns>A value indicating whether testing should be used.</returns>
+    public bool UseTesting(RemotePluginManifest manifest)
+    {
+        return this.CanUseTesting(manifest) && this.HasTestingOptIn(manifest);
+    }
+
+    /// <inheritdoc/>
+    void IInternalDisposableService.DisposeService()
+    {
+        this.UnloadAllPlugins().Wait();
+    }
+
+    /// <summary>
+    /// Unloads all loaded plugins.
+    /// </summary>
+    /// <returns>Task that will resolve once all plugins are unloaded.</returns>
+    public async Task UnloadAllPlugins()
+    {
+        var disposablePlugins = this.installedPluginsList
+                .Where(plugin => plugin.State is PluginState.Loaded or PluginState.LoadError)
+                .ToArray();
+
+        if (disposablePlugins.Length == 0)
+            return;
+
+        Log.Information("==== UNLOADING ALL PLUGINS ====");
+
+        // Any unload/dispose operation called from this function log errors on their own.
+        // Ignore all errors.
+
+        // Unload plugins that requires to be unloaded synchronously,
+        // just in case some plugin codes are still running via callbacks initiated externally.
+        foreach (var plugin in disposablePlugins.Where(plugin => !plugin.Manifest.CanUnloadAsync))
+            await plugin.UnloadAsync(PluginLoaderDisposalMode.None).SuppressException();
+
+        // Unload plugins that can be unloaded from any thread.
+        await Task.WhenAll(
+                      disposablePlugins.Where(plugin => plugin.Manifest.CanUnloadAsync)
+                                       .Select(plugin => plugin.UnloadAsync(PluginLoaderDisposalMode.None)))
+                  .SuppressException();
+
+        // Just in case plugins still have tasks running that they didn't cancel when they should have,
+        // give them some time to complete it.
+        // This helps avoid plugins being reloaded from conflicting with itself of previous instance.
+        await Task.Delay(this.configuration.PluginWaitBeforeFree ?? PluginWaitBeforeFreeDefault);
+
+        // Now that we've waited enough, dispose the whole plugin.
+        // Since plugins should have been unloaded above, this should complete quickly.
+        await Task.WhenAll(disposablePlugins.Select(plugin => plugin.DisposeAsync().AsTask()))
+                  .SuppressException();
+    }
+
+    /// <summary>
+    /// Set the list of repositories to use and downloads their contents.
+    /// Should be called when the Settings window has been updated or at instantiation.
+    /// </summary>
+    /// <param name="notify">Whether the available plugins changed event should be sent after.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    public async Task SetPluginReposFromConfigAsync(bool notify)
+    {
+        var repos = new List<PluginRepository> { this.MainRepo };
+        repos.AddRange(this.configuration.ThirdRepoList
+                           .Where(repo => repo.IsEnabled && !repo.Url.IsNullOrEmpty())
+                           .DistinctBy(x => x.Url)
+                           .Select(repo => new PluginRepository(this.happyHttpClient, repo.Url, repo.IsEnabled)));
+
+        this.Repos = repos;
+        await this.ReloadAllReposAsync();
+    }
+
+    /// <summary>
+    /// Reload all plugin repositories. This is called after setting repos from config, but can also be called manually to refresh repos.
+    /// </summary>
+    /// <returns>Task that will resolve once all repos are reloaded.</returns>
+    public async Task ReloadAllReposAsync()
+    {
+        if (this.repoRefreshTask is null or { IsCompleted: true })
+            this.repoRefreshTask = this.ReloadAllReposInternalAsync();
+
+        await this.repoRefreshTask;
+    }
+
+    /// <summary>
+    /// Wait for the plugin repositories to finish refreshing.
+    /// </summary>
+    /// <returns>Task that will resolve once all repos are reloaded, or a completed task if no reload operation is in progress.</returns>
+    public Task WaitForReposAsync() =>
+        this.repoRefreshTask ?? throw new Exception("Repo refresh task was never set.");
+
+    /// <summary>
+    /// Load all plugins, sorted by priority. Any plugins with no explicit definition file or a negative priority
+    /// are loaded asynchronously.
+    /// </summary>
+    /// <remarks>
+    /// This should only be called during Dalamud startup.
+    /// </remarks>
+    /// <returns>The task.</returns>
+    public async Task LoadAllPlugins()
+    {
+        var pluginDefs = new List<PluginDef>();
+        var devPluginDefs = new List<PluginDef>();
+
+        if (!this.pluginDirectory.Exists)
+            this.pluginDirectory.Create();
+
+        // Add installed plugins. These are expected to be in a specific format so we can look for exactly that.
+        foreach (var pluginDir in this.pluginDirectory.GetDirectories())
+        {
+            var versionsDefs = new List<PluginDef>();
+            foreach (var versionDir in pluginDir.GetDirectories())
+            {
+                try
+                {
+                    var dllFile = new FileInfo(Path.Combine(versionDir.FullName, $"{pluginDir.Name}.dll"));
+                    if (!dllFile.Exists)
+                    {
+                        Log.Error("No DLL found for plugin at {Path}", versionDir.FullName);
+                        continue;
+                    }
+
+                    var manifestFile = LocalPluginManifest.GetManifestFile(dllFile);
+                    if (!manifestFile.Exists)
+                    {
+                        Log.Error("No manifest for plugin at {Path}", dllFile.FullName);
+                        continue;
+                    }
+
+                    var manifest = LocalPluginManifest.Load(manifestFile);
+                    if (manifest == null)
+                    {
+                        Log.Error("Manifest for plugin at {Path} was null", dllFile.FullName);
+                        continue;
+                    }
+
+                    // NOTE(goat): We don't know this anymore after the manifest migration, but it shouldn't matter anymore, everyone should be migrated
+                    // if (manifest.IsTestingExclusive && this.configuration.PluginTestingOptIns!.All(x => x.InternalName != manifest.InternalName))
+                    //    this.configuration.PluginTestingOptIns.Add(new PluginTestingOptIn(manifest.InternalName));
+
+                    versionsDefs.Add(new PluginDef(dllFile, manifest, null));
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Could not load manifest for installed at {Directory}", versionDir.FullName);
+                }
+            }
+
+            this.configuration.QueueSave();
+
+            if (versionsDefs.Count == 0)
+            {
+                Log.Verbose("No versions found for plugin: {Name}", pluginDir.Name);
+                continue;
+            }
+
+            try
+            {
+                pluginDefs.Add(versionsDefs.MaxBy(x => x.Manifest!.AssemblyVersion));
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Couldn't choose best version for plugin: {Name}", pluginDir.Name);
+            }
+        }
+
+        // Sort for load order - unloaded definitions have default priority of 0
+        pluginDefs.Sort(PluginDef.Sorter);
+
+        var isDevModeEnabled = this.configuration.DevMode == true;
+        if (isDevModeEnabled)
+        {
+            foreach (var loadLocation in this.configuration.DevPluginLoadLocations)
+            {
+                if (!loadLocation.IsEnabled)
+                    continue;
+
+                var fileInfo = new FileInfo(loadLocation.Path);
+                if (!fileInfo.Exists)
+                {
+                    Log.Error("Dev plugin path {Path} does not exist", loadLocation.Path);
+                    continue;
+                }
+
+                try
+                {
+                    // Manifests are now required for devPlugins
+                    var manifestFile = LocalPluginManifest.GetManifestFile(fileInfo);
+                    if (!manifestFile.Exists)
+                    {
+                        Log.Error("DLL at {DllPath} has no manifest, this is no longer valid", fileInfo.FullName);
+                        continue;
+                    }
+
+                    var manifest = LocalPluginManifest.Load(manifestFile);
+                    if (manifest == null)
+                    {
+                        Log.Error("Could not deserialize manifest for DLL at {DllPath}", fileInfo.FullName);
+                        continue;
+                    }
+
+                    if (manifest != null && manifest.InternalName.IsNullOrEmpty())
+                    {
+                        Log.Error("InternalName for dll at {Path} was null", manifestFile.FullName);
+                        continue;
+                    }
+
+                    devPluginDefs.Add(new PluginDef(fileInfo, manifest, loadLocation));
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Could not load manifest for dev at {Directory}", fileInfo.FullName);
+                }
+            }
+
+            devPluginDefs.Sort(PluginDef.Sorter);
+
+            // Dev plugins should load first.
+            pluginDefs.InsertRange(0, devPluginDefs);
+        }
+
+        async Task LoadPluginOnBoot(string logPrefix, PluginDef pluginDef, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            using (Timings.Start($"{pluginDef.DllFile.Name}: {logPrefix}Boot"))
+            {
+                try
+                {
+                    await this.LoadPluginAsync(
+                        pluginDef.DllFile,
+                        pluginDef.Manifest,
+                        PluginLoadReason.Boot,
+                        pluginDef.DevPluginLocation,
+                        isBoot: true);
+                }
+                catch (InvalidPluginException)
+                {
+                    // Not a plugin
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "{0}: During boot plugin load, an unexpected error occurred", logPrefix);
+                }
+            }
+        }
+
+        async Task LoadPluginsSync(string logPrefix, IEnumerable<PluginDef> pluginDefsList, CancellationToken token)
+        {
+            Log.Information($"============= LoadPluginsSync({logPrefix}) START =============");
+
+            foreach (var pluginDef in pluginDefsList)
+                await LoadPluginOnBoot(logPrefix, pluginDef, token).ConfigureAwait(false);
+
+            Log.Information($"============= LoadPluginsSync({logPrefix}) END =============");
+        }
+
+        async Task LoadPluginsAsync(string logPrefix, IEnumerable<PluginDef> pluginDefsList, CancellationToken token)
+        {
+            Log.Information($"============= LoadPluginsAsync({logPrefix}) START =============");
+
+            await Task.WhenAll(
+                pluginDefsList
+                    .Select(pluginDef =>
+                                Task.Run(
+                                    Timings.AttachTimingHandle(
+                                             () => LoadPluginOnBoot(logPrefix, pluginDef, token)),
+                                    token))
+                    .ToArray()).ConfigureAwait(false);
+
+            Log.Information($"============= LoadPluginsAsync({logPrefix}) END =============");
+        }
+
+        // Initialize the startup load tracker for all LoadSync plugins
+        {
+            this.StartupLoadTracking = new();
+            foreach (var pluginDef in pluginDefs.Where(x => x.Manifest.LoadSync))
+            {
+                this.StartupLoadTracking.Add(pluginDef.Manifest!.InternalName, pluginDef.Manifest.Name);
+            }
+        }
+
+        var syncPlugins = pluginDefs.Where(def => def.Manifest?.LoadSync == true).ToList();
+        var asyncPlugins = pluginDefs.Where(def => def.Manifest?.LoadSync != true).ToList();
+        var loadTasks = new List<Task>();
+
+        var tokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+
+        // Load plugins that can be loaded anytime
+        await LoadPluginsSync(
+            "AnytimeSync",
+            syncPlugins.Where(def => def.Manifest?.LoadRequiredState == 2),
+            tokenSource.Token);
+        loadTasks.Add(LoadPluginsAsync(
+                          "AnytimeAsync",
+                          asyncPlugins.Where(def => def.Manifest?.LoadRequiredState == 2),
+                          tokenSource.Token));
+
+        // Pass the rest of plugin loading to another thread(task)
+        _ = Task.Run(
+            async () =>
+            {
+                Log.Verbose("Starting async boot load");
+
+                // Load plugins that want to be loaded during Framework.Tick
+                var framework = await Service<Framework>.GetAsync().ConfigureAwait(false);
+                await framework.RunOnTick(
+                    () => LoadPluginsSync(
+                        "FrameworkTickSync",
+                        syncPlugins.Where(def => def.Manifest?.LoadRequiredState == 1),
+                        tokenSource.Token),
+                    cancellationToken: tokenSource.Token).ConfigureAwait(false);
+                Log.Verbose("Loaded FrameworkTickSync plugins (LoadRequiredState == 1)");
+
+                loadTasks.Add(LoadPluginsAsync(
+                                  "FrameworkTickAsync",
+                                  asyncPlugins.Where(def => def.Manifest?.LoadRequiredState == 1),
+                                  tokenSource.Token));
+                Log.Verbose("Kicked off FrameworkTickAsync plugins (LoadRequiredState == 1)");
+
+                // Load plugins that want to be loaded during Framework.Tick, when drawing facilities are available
+                _ = await Service<InterfaceManager.InterfaceManagerWithScene>.GetAsync().ConfigureAwait(false);
+                Log.Verbose(" InterfaceManager is ready, starting to load DrawAvailableSync plugins");
+                await framework.RunOnTick(
+                    () => LoadPluginsSync(
+                        "DrawAvailableSync",
+                        syncPlugins.Where(def => def.Manifest?.LoadRequiredState is 0 or null),
+                        tokenSource.Token),
+                    cancellationToken: tokenSource.Token);
+                Log.Verbose("Loaded DrawAvailableSync plugins (LoadRequiredState == 0 or null)");
+
+                loadTasks.Add(LoadPluginsAsync(
+                                  "DrawAvailableAsync",
+                                  asyncPlugins.Where(def => def.Manifest?.LoadRequiredState is 0 or null),
+                                  tokenSource.Token));
+                Log.Verbose("Kicked off DrawAvailableAsync plugins (LoadRequiredState == 0 or null)");
+
+                // Save signatures when all plugins are done loading, successful or not.
+                try
+                {
+                    Log.Verbose("Now waiting for {NumTasks} async load tasks", loadTasks.Count);
+                    await Task.WhenAll(loadTasks).ConfigureAwait(false);
+                    Log.Information("Loaded plugins on boot");
+                }
+                catch (Exception e)
+                {
+                    Log.Error(e, "Failed to load at least one plugin");
+                }
+
+                var sigScanner = await Service<TargetSigScanner>.GetAsync().ConfigureAwait(false);
+                this.PluginsReady = true;
+                this.NotifyInstalledPluginsChanged();
+                sigScanner.Save();
+
+                try
+                {
+                    this.ParanoiaValidatePluginsAndProfiles();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Plugin and profile validation failed!");
+                }
+
+                this.StartupLoadTracking = null;
+            }, tokenSource.Token).ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                {
+                    Log.Error(t.Exception, "Failed to load FrameworkTickAsync/DrawAvailableAsync plugins");
+                    return;
+                }
+
+                if (t.IsCanceled)
+                {
+                    Log.Error("Loading FrameworkTickAsync/DrawAvailableAsync plugins was canceled");
+                    return;
+                }
+
+                Log.Verbose("Finished async boot load");
+            });
+    }
+
+    /// <summary>
+    /// Scan the devPlugins folder for new DLL files that are not already loaded into the manager. They are not loaded,
+    /// only shown as disabled in the installed plugins window. This is a modified version of LoadAllPlugins that works
+    /// a little differently.
+    /// </summary>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation. This function generally will not block as new plugins aren't loaded.</returns>
+    public async Task ScanDevPluginsAsync()
+    {
+        var listChanged = false;
+
+        foreach (var loadLocation in this.configuration.DevPluginLoadLocations)
+        {
+            if (!loadLocation.IsEnabled)
+                continue;
+
+            var fileInfo = new FileInfo(loadLocation.Path);
+            if (!fileInfo.Exists)
+            {
+                Log.Error("Dev plugin path {Path} does not exist", loadLocation.Path);
+                continue;
+            }
+
+            Log.Verbose("Scanned dev plugin at {Path}", loadLocation.Path);
+
+            // This file is already known to us
+            using (this.pluginListLock.EnterScope())
+            {
+                if (this.installedPluginsList.Any(lp => lp.DllFile.FullName == fileInfo.FullName))
+                    continue;
+            }
+
+            // Manifests are now required for devPlugins
+            var manifestFile = LocalPluginManifest.GetManifestFile(fileInfo);
+            if (!manifestFile.Exists)
+            {
+                Log.Error("DLL at {DllPath} has no manifest, this is no longer valid", fileInfo.FullName);
+                continue;
+            }
+
+            var manifest = LocalPluginManifest.Load(manifestFile);
+            if (manifest == null)
+            {
+                Log.Error("Could not deserialize manifest for DLL at {DllPath}", fileInfo.FullName);
+                continue;
+            }
+
+            try
+            {
+                // Add them to the list and let the user decide, nothing is auto-loaded.
+                await this.LoadPluginAsync(fileInfo, manifest, PluginLoadReason.Installer, devPluginLocation: loadLocation, doNotLoad: true);
+                listChanged = true;
+            }
+            catch (InvalidPluginException)
+            {
+                // Not a plugin
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "During devPlugin scan, an unexpected error occurred");
+            }
+        }
+
+        if (listChanged)
+            this.NotifyInstalledPluginsChanged();
+    }
+
+    /// <summary>
+    /// Install a plugin from a repository and load it.
+    /// </summary>
+    /// <param name="repoManifest">The plugin definition.</param>
+    /// <param name="useTesting">If the testing version should be used.</param>
+    /// <param name="reason">The reason this plugin was loaded.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    public async Task<LocalPlugin> InstallPluginAsync(
+        RemotePluginManifest repoManifest, bool useTesting, PluginLoadReason reason)
+    {
+        var stream = await this.DownloadPluginAsync(repoManifest, useTesting);
+        return await this.InstallPluginInternalAsync(repoManifest, useTesting, reason, stream);
+    }
+
+    /// <summary>
+    /// Remove a plugin.
+    /// </summary>
+    /// <param name="plugin">Plugin to remove.</param>
+    public void RemovePlugin(LocalPlugin plugin)
+    {
+        if (plugin.State != PluginState.Unloaded && plugin.HasEverStartedLoad)
+            throw new InvalidPluginOperationException($"Unable to remove {plugin.Name}, not unloaded and had loaded before");
+
+        using (this.pluginListLock.EnterScope())
+            this.installedPluginsList.Remove(plugin);
+
+        this.NotifyInstalledPluginsChanged();
+        this.NotifyAvailablePluginsChanged();
+    }
+
+    /// <summary>
+    /// Cleanup disabled and broken plugins. Does not target devPlugins.
+    /// </summary>
+    public void CleanupPlugins()
+    {
+        foreach (var pluginDir in this.pluginDirectory.GetDirectories())
+        {
+            try
+            {
+                if (File.Exists(Path.Combine(pluginDir.FullName, BrokenMarkerFileName)))
+                {
+                    Log.Warning("Cleaning up broken plugin {Name}", pluginDir.Name);
+                    pluginDir.Delete(true);
+                    continue;
+                }
+
+                var versionDirs = pluginDir.GetDirectories();
+
+                versionDirs = versionDirs
+                              .OrderByDescending(dir =>
+                              {
+                                  var isVersion = Version.TryParse(dir.Name, out var version);
+
+                                  if (!isVersion)
+                                  {
+                                      Log.Debug($"Not a version, cleaning up {dir.FullName}");
+                                      dir.Delete(true);
+                                  }
+
+                                  return version;
+                              })
+                              .ToArray();
+
+                if (versionDirs.Length == 0)
+                {
+                    Log.Information($"No versions: cleaning up {pluginDir.FullName}");
+                    pluginDir.Delete(true);
+                }
+                else
+                {
+                    for (var i = 0; i < versionDirs.Length; i++)
+                    {
+                        var versionDir = versionDirs[i];
+                        try
+                        {
+                            if (i != 0)
+                            {
+                                Log.Information($"Old version: cleaning up {versionDir.FullName}");
+                                versionDir.Delete(true);
+                                continue;
+                            }
+
+                            var dllFile = new FileInfo(Path.Combine(versionDir.FullName, $"{pluginDir.Name}.dll"));
+                            if (!dllFile.Exists)
+                            {
+                                Log.Information($"Missing dll: cleaning up {versionDir.FullName}");
+                                versionDir.Delete(true);
+                                continue;
+                            }
+
+                            var manifestFile = LocalPluginManifest.GetManifestFile(dllFile);
+                            if (!manifestFile.Exists)
+                            {
+                                Log.Information($"Missing manifest: cleaning up {versionDir.FullName}");
+                                versionDir.Delete(true);
+                                continue;
+                            }
+
+                            if (manifestFile.Length == 0)
+                            {
+                                Log.Information($"Manifest empty: cleaning up {versionDir.FullName}");
+                                versionDir.Delete(true);
+                                continue;
+                            }
+
+                            var manifest = LocalPluginManifest.Load(manifestFile);
+                            if (manifest.ScheduledForDeletion)
+                            {
+                                Log.Information($"Scheduled deletion: cleaning up {versionDir.FullName}");
+                                versionDir.Delete(true);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, $"Could not clean up {versionDir.FullName}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Could not clean up {pluginDir.FullName}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Update all non-dev plugins.
+    /// </summary>
+    /// <param name="toUpdate">List of plugins to update.</param>
+    /// <param name="dryRun">Perform a dry run, don't install anything.</param>
+    /// <param name="autoUpdate">If this action was performed as part of an auto-update.</param>
+    /// <param name="progress">An <see cref="IProgress{T}"/> implementation to receive progress updates about the installation status.</param>
+    /// <returns>Success or failure and a list of updated plugin metadata.</returns>
+    public async Task<IEnumerable<PluginUpdateStatus>> UpdatePluginsAsync(
+        ICollection<AvailablePluginUpdate> toUpdate,
+        bool dryRun,
+        bool autoUpdate = false,
+        IProgress<PluginUpdateProgress>? progress = null)
+    {
+        Log.Information("Starting plugin update");
+
+        var updateTasks = new List<Task<PluginUpdateStatus>>();
+        var totalPlugins = toUpdate.Count;
+        var processedPlugins = 0;
+
+        foreach (var plugin in toUpdate)
+        {
+            // Can't update that!
+            if (plugin.InstalledPlugin.IsDev)
+                continue;
+
+            if (plugin.InstalledPlugin.Manifest.ScheduledForDeletion)
+                continue;
+
+            updateTasks.Add(UpdateSinglePluginWithProgressAsync(plugin));
+        }
+
+        var updatedList = await Task.WhenAll(updateTasks);
+
+        this.NotifyInstalledPluginsChanged();
+        this.NotifyPluginsForStateChange(
+            autoUpdate ? PluginListInvalidationKind.AutoUpdate : PluginListInvalidationKind.Update,
+            updatedList.Select(x => x.AffectedPlugin));
+
+        Log.Information("Plugin update OK. {UpdateCount} plugins updated", updatedList.Length);
+
+        return updatedList;
+
+        async Task<PluginUpdateStatus> UpdateSinglePluginWithProgressAsync(AvailablePluginUpdate plugin)
+        {
+            var result = await this.UpdateSinglePluginAsync(plugin, false, dryRun);
+
+            // Update the progress
+            if (progress != null)
+            {
+                var newProcessedAmount = Interlocked.Increment(ref processedPlugins);
+                progress.Report(new PluginUpdateProgress(
+                                    newProcessedAmount,
+                                    totalPlugins,
+                                    plugin.InstalledPlugin.Manifest));
+            }
+
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Update a single plugin, provided a valid <see cref="AvailablePluginUpdate"/>.
+    /// </summary>
+    /// <param name="metadata">The available plugin update.</param>
+    /// <param name="notify">Whether to notify that installed plugins have changed afterwards.</param>
+    /// <param name="dryRun">Whether to actually perform the update, or just indicate success.</param>
+    /// <returns>The status of the update.</returns>
+    public async Task<PluginUpdateStatus> UpdateSinglePluginAsync(AvailablePluginUpdate metadata, bool notify, bool dryRun)
+    {
+        var plugin = metadata.InstalledPlugin;
+
+        var workingPluginId = metadata.InstalledPlugin.EffectiveWorkingPluginId;
+        if (workingPluginId == Guid.Empty)
+            throw new Exception("Existing plugin had no WorkingPluginId");
+
+        var version = metadata.UseTesting ? metadata.UpdateManifest.TestingAssemblyVersion : metadata.UpdateManifest.AssemblyVersion;
+        var updateStatus = new PluginUpdateStatus
+        {
+            AffectedPlugin = new ActivePluginsChangedEventArgs.AffectedPlugin(plugin, version),
+            Status = PluginUpdateStatus.StatusKind.Success,
+            HasChangelog = !metadata.UpdateManifest.Changelog.IsNullOrWhitespace(),
+        };
+
+        // Check if this plugin is already up to date (=> AvailablePluginUpdate was stale)
+        lock (this.installedPluginsList)
+        {
+            var matchedPlugin = this.installedPluginsList.FirstOrDefault(x => x.EffectiveWorkingPluginId == workingPluginId);
+            if (matchedPlugin?.EffectiveVersion == metadata.EffectiveVersion)
+            {
+                Log.Information("Plugin {Name} is already up to date", plugin.Manifest.Name);
+                updateStatus.Status = PluginUpdateStatus.StatusKind.AlreadyUpToDate;
+                return updateStatus;
+            }
+        }
+
+        if (!dryRun)
+        {
+            // Download the update before unloading
+            Stream updateStream;
+            try
+            {
+                updateStream = await this.DownloadPluginAsync(metadata.UpdateManifest, metadata.UseTesting);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Error during download (update)");
+                updateStatus.Status = PluginUpdateStatus.StatusKind.FailedDownload;
+                return updateStatus;
+            }
+
+            // Unload if loaded
+            if (plugin.State is PluginState.Loaded or PluginState.LoadError or PluginState.DependencyResolutionFailed)
+            {
+                try
+                {
+                    await plugin.UnloadAsync();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Error during unload (update)");
+                    updateStatus.Status = PluginUpdateStatus.StatusKind.FailedUnload;
+                    return updateStatus;
+                }
+            }
+
+            if (plugin.IsDev)
+            {
+                throw new Exception("We should never update a dev plugin");
+            }
+
+            try
+            {
+                await this.InstallPluginInternalAsync(metadata.UpdateManifest, metadata.UseTesting, PluginLoadReason.Update, updateStream, plugin);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Error during install (update)");
+                updateStatus.Status = PluginUpdateStatus.StatusKind.FailedLoad;
+                return updateStatus;
+            }
+        }
+
+        if (notify && updateStatus.Status == PluginUpdateStatus.StatusKind.Success)
+            this.NotifyInstalledPluginsChanged();
+
+        return updateStatus;
+    }
+
+    /// <summary>
+    /// Delete the plugin configuration, unload/reload it if loaded.
+    /// </summary>
+    /// <param name="plugin">The plugin.</param>
+    /// <exception cref="Exception">Throws if the plugin is still loading/unloading.</exception>
+    /// <returns>The task.</returns>
+    public async Task DeleteConfigurationAsync(LocalPlugin plugin)
+    {
+        if (plugin.State is PluginState.Loading or PluginState.Unloading)
+            throw new Exception("Cannot delete configuration for a loading/unloading plugin");
+
+        var isReloading = plugin.IsLoaded;
+        if (isReloading)
+            await plugin.UnloadAsync();
+
+        for (var waitUntil = Environment.TickCount64 + 1000; Environment.TickCount64 < waitUntil;)
+        {
+            try
+            {
+                this.PluginConfigs.Delete(plugin.Manifest.InternalName);
+                break;
+            }
+            catch (IOException)
+            {
+                await Task.Delay(100);
+            }
+        }
+
+        if (isReloading)
+        {
+            // Let's indicate "installer" here since this is supposed to be a fresh install
+            await plugin.LoadAsync(PluginLoadReason.Installer);
+        }
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether the given manifest is eligible for ANYTHING. These are hard
+    /// checks that should not allow installation or loading.
+    /// </summary>
+    /// <param name="manifest">Plugin manifest.</param>
+    /// <returns>If the manifest is eligible.</returns>
+    public bool IsManifestEligible(RemotePluginManifest manifest)
+    {
+        // Testing exclusive
+        if (manifest.IsTestingExclusive && !this.configuration.DoPluginTest)
+            return false;
+
+        // Applicable version
+        if (manifest.ApplicableVersion < this.dalamud.StartInfo.GameVersion)
+            return false;
+
+        // API level - we keep the API before this in the installer to show as "outdated"
+        {
+            var effectiveDalamudApiLevel =
+                this.CanUseTesting(manifest) &&
+                manifest.TestingDalamudApiLevel.HasValue &&
+                manifest.TestingDalamudApiLevel.Value > manifest.DalamudApiLevel
+                    ? manifest.TestingDalamudApiLevel.Value
+                    : manifest.DalamudApiLevel;
+
+            if (effectiveDalamudApiLevel < DalamudApiLevel - 1)
+                return false;
+        }
+
+        // Banned
+        if (this.IsManifestBanned(manifest))
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Determine if a plugin has been banned by inspecting the manifest.
+    /// </summary>
+    /// <param name="manifest">Manifest to inspect.</param>
+    /// <returns>A value indicating whether the plugin/manifest has been banned.</returns>
+    public bool IsManifestBanned(IPluginManifest manifest)
+    {
+        if (this.bannedPlugins == null)
+            throw new Exception("Banned plugins not loaded");
+
+        if (this.LoadBannedPlugins)
+            return false;
+
+        var versionToCheck = manifest.AssemblyVersion;
+        if (manifest is RemotePluginManifest remoteManifest && this.UseTesting(remoteManifest) && remoteManifest.TestingAssemblyVersion > manifest.AssemblyVersion)
+        {
+            versionToCheck = remoteManifest.TestingAssemblyVersion;
+        }
+
+        return this.bannedPlugins.Any(ban => (ban.Name == manifest.InternalName || ban.Name == Hash.GetStringSha256Hash(manifest.InternalName))
+                                                                        && (ban.AssemblyVersion == null || ban.AssemblyVersion >= versionToCheck));
+    }
+
+    /// <summary>
+    /// Get the reason of a banned plugin by inspecting the manifest.
+    /// </summary>
+    /// <param name="manifest">Manifest to inspect.</param>
+    /// <returns>The reason of the ban, if any.</returns>
+    public string GetBanReason(PluginManifest manifest)
+    {
+        Debug.Assert(this.bannedPlugins != null, "this.bannedPlugins != null");
+
+        return this.bannedPlugins.LastOrDefault(ban => ban.Name == manifest.InternalName).Reason;
+    }
+
+    /// <summary>
+    /// Get the plugin that called this method by walking the provided stack trace,
+    /// or null, if it cannot be determined.
+    /// At the time, this is naive and shouldn't be used for security-critical checks.
+    /// </summary>
+    /// <param name="trace">The trace to walk.</param>
+    /// <returns>The calling plugin, or null.</returns>
+    public LocalPlugin? FindCallingPlugin(StackTrace trace)
+    {
+        foreach (var frame in trace.GetFrames())
+        {
+            var declaringType = frame.GetMethod()?.DeclaringType;
+            if (declaringType == null)
+                continue;
+
+            using (this.pluginListLock.EnterScope())
+            {
+                foreach (var plugin in this.installedPluginsList)
+                {
+                    if (plugin.Assembly != null &&
+                        plugin.Assembly.GetName().FullName == declaringType.Assembly.GetName().FullName)
+                        return plugin;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Notifies all plugins that the active plugins list changed.
+    /// </summary>
+    /// <param name="kind">The invalidation kind.</param>
+    /// <param name="affectedPlugins">The affected plugins.</param>
+    public void NotifyPluginsForStateChange(PluginListInvalidationKind kind, IEnumerable<IActivePluginsChangedEventArgs.IAffectedPlugin> affectedPlugins)
+    {
+        using (this.pluginListLock.EnterScope())
+        {
+            foreach (var installedPlugin in this.installedPluginsList)
+            {
+                if (!installedPlugin.IsLoaded || installedPlugin.DalamudInterface == null)
+                    continue;
+
+                installedPlugin.DalamudInterface.NotifyActivePluginsChanged(new ActivePluginsChangedEventArgs(kind, affectedPlugins));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Resolves the services that a plugin may have a dependency on.<br />
+    /// This is required, as the lifetime of a plugin cannot be longer than PluginManager,
+    /// and we want to ensure that dependency services to be kept alive at least until all the plugins, and thus
+    /// PluginManager to be gone.
+    /// </summary>
+    /// <returns>The dependency services.</returns>
+    private static IEnumerable<Type> ResolvePossiblePluginDependencyServices()
+    {
+        // DalamudPluginInterface hands out a reference to this, so we have to keep it around.
+        // TODO api9: make it a service
+        yield return typeof(DataShare);
+
+        // DalamudTextureWrap registers textures to dispose with IM.
+        yield return typeof(InterfaceManager);
+
+        // Note: LocalPlugin uses ServiceContainer to create scopes, but it is done outside PM ctor.
+        // This is not required: yield return typeof(ServiceContainer);
+
+        foreach (var serviceType in ServiceManager.GetConcreteServiceTypes())
+        {
+            if (serviceType == typeof(PluginManager))
+                continue;
+
+            // Scoped plugin services lifetime is tied to their scopes. They go away when LocalPlugin goes away.
+            // Nonetheless, their direct dependencies must be considered.
+            if (serviceType.GetServiceKind() == ServiceManager.ServiceKind.ScopedService)
+            {
+                var typeAsServiceT = ServiceHelpers.GetAsService(serviceType);
+                var dependencies = ServiceHelpers.GetDependencies(typeAsServiceT, false);
+                ServiceManager.Log.Verbose("Found dependencies of scoped plugin service {Type} ({Cnt})", serviceType.FullName!, dependencies!.Count);
+
+                foreach (var scopedDep in dependencies)
+                {
+                    if (scopedDep == typeof(PluginManager))
+                        throw new Exception("Scoped plugin services cannot depend on PluginManager.");
+
+                    ServiceManager.Log.Verbose("PluginManager MUST depend on {Type} via {BaseType}", scopedDep.FullName!, serviceType.FullName!);
+                    yield return scopedDep;
+                }
+
+                continue;
+            }
+
+            var pluginInterfaceAttribute = serviceType.GetCustomAttribute<PluginInterfaceAttribute>(true);
+            if (pluginInterfaceAttribute == null)
+                continue;
+
+            ServiceManager.Log.Verbose("PluginManager MUST depend on {Type}", serviceType.FullName!);
+            yield return serviceType;
+        }
+    }
+
+    /// <summary>
+    /// Check if there are any inconsistencies with our plugins, their IDs, and our profiles.
+    /// </summary>
+    private void ParanoiaValidatePluginsAndProfiles()
+    {
+        var seenIds = new List<Guid>();
+
+        foreach (var installedPlugin in this.InstalledPlugins)
+        {
+            if (installedPlugin.EffectiveWorkingPluginId == Guid.Empty)
+                throw new Exception($"{(installedPlugin is LocalDevPlugin ? "DevPlugin" : "Plugin")} '{installedPlugin.Manifest.InternalName}' has an empty WorkingPluginId.");
+
+            if (seenIds.Contains(installedPlugin.EffectiveWorkingPluginId))
+            {
+                throw new Exception(
+                    $"{(installedPlugin is LocalDevPlugin ? "DevPlugin" : "Plugin")} '{installedPlugin.Manifest.InternalName}' has a duplicate WorkingPluginId '{installedPlugin.EffectiveWorkingPluginId}'");
+            }
+
+            seenIds.Add(installedPlugin.EffectiveWorkingPluginId);
+        }
+
+        this.profileManager.ParanoiaValidateProfiles();
+    }
+
+    private async Task<Stream> DownloadPluginAsync(RemotePluginManifest repoManifest, bool useTesting)
+    {
+        var downloadUrl = useTesting ? repoManifest.DownloadLinkTesting : repoManifest.DownloadLinkInstall;
+        var request = new HttpRequestMessage(HttpMethod.Get, downloadUrl)
+        {
+            Headers =
+            {
+                Accept =
+                {
+                    new MediaTypeWithQualityHeaderValue("application/zip"),
+                },
+            },
+        };
+        var response = await this.happyHttpClient.SharedHttpClient.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+
+        return await response.Content.ReadAsStreamAsync();
+    }
+
+    /// <summary>
+    /// Install a plugin from a repository and load it.
+    /// </summary>
+    /// <param name="repoManifest">The plugin definition.</param>
+    /// <param name="useTesting">If the testing version should be used.</param>
+    /// <param name="reason">The reason this plugin was loaded.</param>
+    /// <param name="zipStream">Stream of the ZIP archive containing the plugin that is about to be installed.</param>
+    /// <param name="pluginToReplace">The plugin that is being replaced by this installation (used during an update).</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    private async Task<LocalPlugin> InstallPluginInternalAsync(
+        RemotePluginManifest repoManifest,
+        bool useTesting,
+        PluginLoadReason reason,
+        Stream zipStream,
+        LocalPlugin? pluginToReplace = null)
+    {
+        var version = useTesting ? repoManifest.TestingAssemblyVersion : repoManifest.AssemblyVersion;
+        Log.Debug($"Installing plugin {repoManifest.Name} (testing={useTesting}, version={version}, reason={reason})");
+
+        // If this plugin is in the default profile for whatever reason, delete the state
+        // If it was in multiple profiles and is still, the user uninstalled it and chose to keep it in there,
+        // or the user removed the plugin manually in which case we don't care
+        if (reason == PluginLoadReason.Installer)
+        {
+            try
+            {
+                // Only remove entries from the default profile that are NOT currently tied to an active LocalPlugin
+                var guidsToRemove = this.profileManager.DefaultProfile.Plugins
+                                        .Where(x => this.InstalledPlugins.All(y => y.EffectiveWorkingPluginId != x.WorkingPluginId))
+                                        .Select(x => x.WorkingPluginId)
+                                        .ToArray();
+
+                if (guidsToRemove.Length != 0)
+                {
+                    Log.Verbose("Removing {Cnt} orphaned entries from default profile", guidsToRemove.Length);
+                    foreach (var guid in guidsToRemove)
+                    {
+                        // We don't need to apply, it doesn't matter
+                        await this.profileManager.DefaultProfile.RemoveAsync(guid, false, false);
+                    }
+                }
+            }
+            catch (ProfileOperationException ex)
+            {
+                Log.Error(ex, "Error during default profile cleanup");
+            }
+        }
+        else
+        {
+            // If we are doing anything other than a fresh install, not having a workingPluginId is an error that must be fixed
+            if (pluginToReplace == null)
+                throw new ArgumentNullException(nameof(pluginToReplace), "Must be replacing a plugin when updating");
+        }
+
+        // Ensure that we have a testing opt-in for this plugin if we are installing a testing version
+        if (useTesting && this.configuration.PluginTestingOptIns!.All(x => x.InternalName != repoManifest.InternalName))
+        {
+            // TODO: this isn't safe
+            this.configuration.PluginTestingOptIns.Add(new PluginTestingOptIn(repoManifest.InternalName));
+            this.configuration.QueueSave();
+        }
+
+        var pluginVersionsDir = new DirectoryInfo(Path.Combine(this.pluginDirectory.FullName, repoManifest.InternalName));
+        var tempOutputDir = new DirectoryInfo(FilesystemUtil.GetTempFileName());
+        var outputDir = new DirectoryInfo(Path.Combine(pluginVersionsDir.FullName, version?.ToString() ?? string.Empty));
+
+        FilesystemUtil.DeleteAndRecreateDirectory(tempOutputDir);
+        FilesystemUtil.DeleteAndRecreateDirectory(outputDir);
+
+        Log.Debug("Extracting plugin to {TempOutputDir}", tempOutputDir);
+
+        try
+        {
+            using var archive = new ZipArchive(zipStream);
+
+            foreach (var zipFile in archive.Entries)
+            {
+                var outputFile = new FileInfo(
+                    Path.GetFullPath(Path.Combine(tempOutputDir.FullName, zipFile.FullName)));
+
+                if (!outputFile.FullName.StartsWith(tempOutputDir.FullName, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new IOException(
+                        "Trying to extract file outside of destination directory. See this link for more info: https://snyk.io/research/zip-slip-vulnerability");
+                }
+
+                if (outputFile.Directory == null)
+                {
+                    throw new IOException("Output directory invalid.");
+                }
+
+                if (zipFile.Name.IsNullOrEmpty())
+                {
+                    // Assuming Empty for Directory
+                    Log.Verbose(
+                        "ZipFile name is null or empty, treating as a directory: {Path}", outputFile.Directory.FullName);
+                    Directory.CreateDirectory(outputFile.Directory.FullName);
+                    continue;
+                }
+
+                // Ensure directory is created
+                Directory.CreateDirectory(outputFile.Directory.FullName);
+                zipFile.ExtractToFile(outputFile.FullName, true);
+            }
+
+            var tempDllFile = LocalPluginManifest.GetPluginFile(tempOutputDir, repoManifest);
+            var tempManifestFile = LocalPluginManifest.GetManifestFile(tempDllFile);
+
+            // Reload as a local manifest, add some attributes, and save again.
+            var tempManifest = LocalPluginManifest.Load(tempManifestFile) ?? throw new Exception("Plugin had no valid manifest");
+            if (tempManifest.InternalName != repoManifest.InternalName)
+            {
+                throw new Exception(
+                    $"Distributed internal name does not match repo internal name, distributed: {tempManifest.InternalName} repo: {repoManifest.InternalName}");
+            }
+
+            if (tempManifest.AssemblyVersion != version)
+            {
+                throw new Exception(
+                    $"Distributed plugin version does not match repo version, distributed: {tempManifest.AssemblyVersion} repo: {version}");
+            }
+
+            if (tempManifest.WorkingPluginId != Guid.Empty)
+                throw new Exception("Plugin shall not specify a WorkingPluginId");
+
+            Guid? newWorkingPluginId;
+            if (pluginToReplace != null)
+            {
+                newWorkingPluginId = pluginToReplace.EffectiveWorkingPluginId;
+                Log.Verbose("WorkingPluginId: Replace {Name} as {WorkingPluginId}", pluginToReplace.InternalName, newWorkingPluginId);
+            }
+            else
+            {
+                newWorkingPluginId = Guid.NewGuid();
+                Log.Verbose("WorkingPluginId: New {Name} as {WorkingPluginId}", tempManifest.InternalName, newWorkingPluginId);
+            }
+
+            tempManifest.WorkingPluginId = newWorkingPluginId ?? throw new Exception("Failed to pick a new WorkingPluginId");
+
+            if (useTesting)
+            {
+                tempManifest.Testing = true;
+            }
+
+            // Document the url the plugin was installed from
+            tempManifest.InstalledFromUrl = repoManifest.SourceRepo.IsThirdParty
+                                                ? repoManifest.SourceRepo.PluginMasterUrl
+                                                : SpecialPluginSource.MainRepo;
+
+            // HACK: We need to do this at the moment so that D17 plugins can load their assets.
+            // Goat should get off his ass and fix the pipeline in Plogon to specify correct URLs
+            tempManifest.Dip17Channel = repoManifest.Dip17Channel;
+
+            tempManifest.Save(tempManifestFile, "installation");
+
+            // Copy the directory to the final location
+            Log.Debug("Copying plugin from {TempOutputDir} to {OutputDir}", tempOutputDir, outputDir);
+            FilesystemUtil.CopyFilesRecursively(tempOutputDir, outputDir);
+
+            var finalDllFile = LocalPluginManifest.GetPluginFile(outputDir, repoManifest);
+            var finalManifestFile = LocalPluginManifest.GetManifestFile(finalDllFile);
+            var finalManifest = LocalPluginManifest.Load(finalManifestFile) ??
+                           throw new Exception("Plugin had no valid manifest after copy");
+
+            Log.Information("Staged plugin {InternalName} (testing={UseTesting})", tempManifest.Name, useTesting);
+            return await this.LoadPluginAsync(finalDllFile, finalManifest, reason, pluginToReplace: pluginToReplace);
+        }
+        catch
+        {
+            // Attempt to clean up if we can
+            try
+            {
+                outputDir.Delete(true);
+            }
+            catch
+            {
+                // Write marker file if we can't, we'll try to do it at the next start
+                File.WriteAllText(Path.Combine(pluginVersionsDir.FullName, BrokenMarkerFileName), string.Empty);
+            }
+
+            throw;
+        }
+        finally
+        {
+            tempOutputDir.Delete(true);
+        }
+    }
+
+    /// <summary>
+    /// Load a plugin.
+    /// </summary>
+    /// <param name="dllFile">The <see cref="FileInfo"/> associated with the main assembly of this plugin.</param>
+    /// <param name="manifest">The already loaded definition, if available.</param>
+    /// <param name="reason">The reason this plugin was loaded.</param>
+    /// <param name="devPluginLocation">The location of the dev plugin, if we are loading a dev plugin.</param>
+    /// <param name="isBoot">If this plugin is being loaded at boot.</param>
+    /// <param name="doNotLoad">Don't load the plugin, just don't do it.</param>
+    /// <param name="pluginToReplace">
+    /// The plugin that is being replaced through this load (used during an update).
+    /// The plugin will be disposed and removed from the list idempotently once the new plugin is ready and valid to be
+    /// added to the loaded plugins list. This is done to avoid having plugins "disappear" after an update, if the update
+    /// fails for whatever reason.
+    /// </param>
+    /// <returns>The loaded plugin.</returns>
+    private async Task<LocalPlugin> LoadPluginAsync(
+        FileInfo dllFile,
+        LocalPluginManifest manifest,
+        PluginLoadReason reason,
+        DevPluginLocationSettings? devPluginLocation = null,
+        bool isBoot = false,
+        bool doNotLoad = false,
+        LocalPlugin? pluginToReplace = null)
+    {
+        // TODO: Split this function - it should only take care of adding the plugin to the list, not loading itself, that should be done through the plugin instance
+
+        var loadPlugin = !doNotLoad;
+
+        LocalPlugin? plugin;
+
+        if (manifest != null && (manifest.InternalName == null || manifest.Name == null))
+        {
+            Log.Error("{FileName}: Your manifest has no internal name or name set! Can't load this.", dllFile.FullName);
+            throw new Exception("No internal name");
+        }
+
+        // Track the plugin as soon as it is instantiated to prevent it from being loaded twice,
+        // if the installer or DevPlugin scanner is attempting to add plugins while we are still loading boot plugins
+        using (this.pluginListLock.EnterScope())
+        {
+            // Check if this plugin is already loaded
+            if (this.installedPluginsList.Any(lp => lp.DllFile.FullName == dllFile.FullName))
+                throw new InvalidOperationException("Plugin at the provided path is already loaded");
+
+            if (devPluginLocation != null)
+            {
+                Log.Information("Loading dev plugin {Name}", manifest.InternalName);
+                plugin = new LocalDevPlugin(dllFile, manifest, devPluginLocation);
+
+                // This is a dev plugin - turn ImGui asserts on by default if we haven't chosen yet
+                // TODO(goat): Re-enable this when we have better tracing for what was rendering when
+                // this.configuration.ImGuiAssertsEnabledAtStartup ??= true;
+            }
+            else
+            {
+                Log.Information("Loading plugin {Name}", manifest.InternalName);
+                plugin = new LocalPlugin(dllFile, manifest);
+            }
+
+            if (pluginToReplace != null)
+            {
+                if (pluginToReplace.IsLoaded)
+                    throw new InvalidOperationException("Plugin must be unloaded before it can be replaced");
+
+                if (!this.installedPluginsList.Remove(pluginToReplace))
+                    throw new InvalidOperationException("Failed to remove plugin that is being replaced");
+
+                Log.Verbose("Removed plugin {Name} v{Version} from loaded plugins list", pluginToReplace.InternalName, pluginToReplace.EffectiveVersion);
+            }
+
+            this.installedPluginsList.Add(plugin);
+            this.NotifyInstalledPluginsChanged();
+
+            Log.Verbose("Added plugin {Name} v{Version} to loaded plugins list", manifest.InternalName, manifest.AssemblyVersion);
+        }
+
+        // Dispose old plugin instance
+        await (pluginToReplace?.DisposeAsync() ?? ValueTask.CompletedTask);
+
+        Log.Verbose("Starting to load plugin {Name} at {FileLocation}", manifest.InternalName, dllFile.FullName);
+
+        // Perform a migration from InternalName to GUIDs. The plugin should definitely have a GUID here.
+        // This will also happen if you are installing a plugin with the installer, and that's intended!
+        // It means that, if you have a profile which has unsatisfied plugins, installing a matching plugin will
+        // enter it into the profiles it can match.
+        if (plugin.EffectiveWorkingPluginId == Guid.Empty)
+            throw new Exception("Plugin should have a WorkingPluginId at this point");
+        this.profileManager.MigrateProfilesToGuidsForPlugin(plugin.Manifest.InternalName, plugin.EffectiveWorkingPluginId);
+
+        var wantedByAnyProfile = false;
+
+        // Now, if this is a devPlugin, figure out if we want to load it
+        if (devPluginLocation != null)
+        {
+            var devPlugin = (LocalDevPlugin)plugin;
+            loadPlugin &= !isBoot;
+
+            var wantsInDefaultProfile =
+                this.profileManager.DefaultProfile.WantsPlugin(plugin.EffectiveWorkingPluginId);
+            if (wantsInDefaultProfile == null)
+            {
+                // We don't know about this plugin, so we don't want to do anything here.
+                // The code below will take care of it and add it with the default value.
+                Log.Verbose("DevPlugin {Name} not wanted in default plugin", plugin.Manifest.InternalName);
+
+                // Check if any profile wants this plugin. We need to do this here, since we want to allow loading a dev plugin if a non-default profile wants it active.
+                // Note that this will not add the plugin to the default profile. That's done below in any other case.
+                wantedByAnyProfile = await this.profileManager.GetWantStateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, false, false);
+
+                // If it is wanted by any other profile, we do want to load it.
+                if (wantedByAnyProfile)
+                    loadPlugin = true;
+            }
+            else if (wantsInDefaultProfile == false && devPlugin.StartOnBoot)
+            {
+                // We didn't want this plugin, and StartOnBoot is on. That means we don't want it and it should stay off until manually enabled.
+                Log.Verbose("DevPlugin {Name} disabled and StartOnBoot => disable", plugin.Manifest.InternalName);
+                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, false, false);
+                loadPlugin = false;
+            }
+            else if (wantsInDefaultProfile == true && devPlugin.StartOnBoot)
+            {
+                // We wanted this plugin, and StartOnBoot is on. That means we actually do want it.
+                Log.Verbose("DevPlugin {Name} enabled and StartOnBoot => enable", plugin.Manifest.InternalName);
+                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, true, false);
+                loadPlugin = !doNotLoad;
+            }
+            else if (wantsInDefaultProfile == true && !devPlugin.StartOnBoot)
+            {
+                // We wanted this plugin, but StartOnBoot is off. This means we don't want it anymore.
+                Log.Verbose("DevPlugin {Name} enabled and !StartOnBoot => disable", plugin.Manifest.InternalName);
+                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, false, false);
+                loadPlugin = false;
+            }
+            else if (wantsInDefaultProfile == false && !devPlugin.StartOnBoot)
+            {
+                // We didn't want this plugin, and StartOnBoot is off. We don't want it.
+                Log.Verbose("DevPlugin {Name} disabled and !StartOnBoot => disable", plugin.Manifest.InternalName);
+                await this.profileManager.DefaultProfile.AddOrUpdateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, false, false);
+                loadPlugin = false;
+            }
+
+            // Never automatically load outdated dev plugins.
+            if (devPlugin.IsOutdated)
+            {
+                loadPlugin = false;
+                Log.Warning("DevPlugin {Name} is outdated, not loading automatically - update DalamudPackager or SDK!", plugin.Manifest.InternalName);
+            }
+
+            plugin = devPlugin;
+        }
+
+#pragma warning disable CS0618
+        var defaultState = manifest?.Disabled != true && loadPlugin;
+#pragma warning restore CS0618
+
+        // Plugins that aren't in any profile will be added to the default profile with this call.
+        // We are skipping a double-lookup for dev plugins that are wanted by non-default profiles, as noted above.
+        wantedByAnyProfile = wantedByAnyProfile || await this.profileManager.GetWantStateAsync(plugin.EffectiveWorkingPluginId, plugin.Manifest.InternalName, defaultState);
+        Log.Information("{Name} defaultState: {State} wantedByAnyProfile: {WantedByAny} loadPlugin: {LoadPlugin}", plugin.Manifest.InternalName, defaultState, wantedByAnyProfile, loadPlugin);
+
+        if (loadPlugin)
+        {
+            try
+            {
+                if (wantedByAnyProfile && !plugin.IsOrphaned)
+                {
+                    await plugin.LoadAsync(reason);
+                }
+                else
+                {
+                    Log.Verbose("{Name} not loaded, wantToLoad:{WantedByAnyProfile} orphaned:{IsOrphaned}", manifest.InternalName, wantedByAnyProfile, plugin.IsOrphaned);
+                }
+            }
+            catch (InvalidPluginException)
+            {
+                throw;
+            }
+            catch (BannedPluginException)
+            {
+                // Out of date plugins get added so they can be updated.
+                Log.Information("{InternalName}: Plugin was banned, adding anyways", plugin.Manifest.InternalName);
+            }
+            catch (Exception ex)
+            {
+                if (plugin.IsDev)
+                {
+                    // Dev plugins always get added to the list so they can be fiddled with in the UI
+                    Log.Information(ex, "{InternalName}: Dev plugin failed to load", plugin.Manifest.InternalName);
+                }
+                else if (plugin.IsOutdated)
+                {
+                    // Out of date plugins get added, so they can be updated.
+                    Log.Information(ex, "{InternalName}: Plugin was outdated", plugin.Manifest.InternalName);
+                }
+                else if (plugin.IsOrphaned)
+                {
+                    // Orphaned plugins get added, so that users aren't confused.
+                    Log.Information(ex, "{InternalName}: Plugin was orphaned", plugin.Manifest.InternalName);
+                }
+                else if (isBoot)
+                {
+                    // During boot load, plugins always get added to the list so they can be fiddled with in the UI
+                    Log.Information(ex, "{InternalName}: Regular plugin failed to load", plugin.Manifest.InternalName);
+                }
+                else if (!plugin.CheckPolicy())
+                {
+                    // During boot load, plugins always get added to the list so they can be fiddled with in the UI
+                    Log.Information(ex, "{InternalName}: Plugin not loaded due to policy", plugin.Manifest.InternalName);
+                }
+                else
+                {
+                    throw;
+                }
+            }
+        }
+
+        // Mark as finished loading
+        if (manifest.LoadSync)
+            this.StartupLoadTracking?.Finish(manifest.InternalName);
+
+        return plugin;
+    }
+
+    private void DetectAvailablePluginUpdates()
+    {
+        Log.Debug("Starting plugin update check...");
+
+        using var scope = this.pluginListLock.EnterScope();
+
+        this.updatablePluginsList.Clear();
+
+        foreach (var plugin in this.installedPluginsList)
+        {
+            var installedVersion = plugin.Manifest.AssemblyVersion;
+
+            var updates = this.AvailablePlugins
+                              .Where(remoteManifest => plugin.Manifest.InternalName == remoteManifest.InternalName)
+                              .Where(remoteManifest => plugin.Manifest.InstalledFromUrl == remoteManifest.SourceRepo.PluginMasterUrl || !remoteManifest.SourceRepo.IsThirdParty)
+                              .Where(remoteManifest => remoteManifest.MinimumDalamudVersion == null || Versioning.GetAssemblyVersionParsed() >= remoteManifest.MinimumDalamudVersion)
+                              .Where(remoteManifest => !remoteManifest.IsTestingExclusive || this.UseTesting(remoteManifest))
+                              .Where(remoteManifest =>
+                              {
+                                  var useTesting = this.UseTesting(remoteManifest);
+                                  var candidateApiLevel = useTesting && remoteManifest.TestingDalamudApiLevel != null
+                                                              ? remoteManifest.TestingDalamudApiLevel.Value
+                                                              : remoteManifest.DalamudApiLevel;
+
+                                  return candidateApiLevel == DalamudApiLevel;
+                              })
+                              .Select(remoteManifest =>
+                              {
+                                  var useTesting = this.UseTesting(remoteManifest);
+                                  var candidateVersion = useTesting
+                                                              ? remoteManifest.TestingAssemblyVersion
+                                                              : remoteManifest.AssemblyVersion;
+                                  var isUpdate = candidateVersion > installedVersion;
+
+                                  return (isUpdate, useTesting, candidateVersion, remoteManifest);
+                              })
+                              .Where(tpl => tpl.isUpdate)
+                              .ToList();
+
+            if (updates.Count > 0)
+            {
+                var update = updates.Aggregate((t1, t2) => t1.candidateVersion > t2.candidateVersion ? t1 : t2);
+                this.updatablePluginsList.Add(new AvailablePluginUpdate(plugin, update.remoteManifest, update.useTesting));
+            }
+        }
+
+        Log.Debug("Update check found {updateCount} available updates.", this.updatablePluginsList.Count);
+    }
+
+    /// <summary>
+    /// Reload the PluginMaster for each repo, filter, and event that the list has updated.
+    /// </summary>
+    /// <param name="notify">Whether to notify that available plugins have changed afterward.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    private async Task ReloadAllReposInternalAsync(bool notify = true)
+    {
+        Log.Information("Now reloading all repos...");
+
+        try
+        {
+            Debug.Assert(!this.Repos.First().IsThirdParty, "First repository should be main repository");
+            await this.Repos.First().ReloadAsync(); // Load official repo first
+
+            await Task.WhenAll(this.Repos.Skip(1).Select(repo => repo.ReloadAsync()));
+
+            Log.Information("Repos reloaded, now refiltering...");
+
+            this.RefilterAvailablePlugins(notify);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Could not reload plugin repositories");
+        }
+    }
+
+    /// <summary>
+    /// Apply visibility and eligibility filters to the available plugins, then event that the list has updated.
+    /// </summary>
+    /// <param name="notify">Whether to notify that available plugins have changed afterwards.</param>
+    private void RefilterAvailablePlugins(bool notify = true)
+    {
+        using var scope = this.pluginListLock.EnterScope();
+
+        this.availablePluginsList.Clear();
+        this.availablePluginsList.AddRange(this.Repos
+                                                .SelectMany(repo => repo.PluginMaster)
+                                                .Where(this.IsManifestEligible)
+                                                .Where(IsManifestVisible));
+
+        if (notify)
+        {
+            this.NotifyAvailablePluginsChanged();
+        }
+    }
+
+    private void NotifyAvailablePluginsChanged()
+    {
+        this.DetectAvailablePluginUpdates();
+
+        this.OnAvailablePluginsChanged?.InvokeSafely();
+    }
+
+    private void NotifyInstalledPluginsChanged()
+    {
+        this.DetectAvailablePluginUpdates();
+
+        this.OnInstalledPluginsChanged?.InvokeSafely();
+    }
+
+    private void LoadAndStartLoadSyncPlugins()
+    {
+        try
+        {
+            using (Timings.Start("PM Load Plugin Repos"))
+            {
+                _ = this.SetPluginReposFromConfigAsync(false);
+                this.OnInstalledPluginsChanged += () => Task.Run(Troubleshooting.LogTroubleshooting);
+
+                Log.Information("Repos loaded!");
+            }
+
+            using (Timings.Start("PM Cleanup Plugins"))
+            {
+                this.CleanupPlugins();
+                Log.Information("Plugin cleanup OK!");
+            }
+
+            using (Timings.Start("PM Load Sync Plugins"))
+            {
+                var loadAllPlugins = Task.Run(this.LoadAllPlugins)
+                                         .ContinueWith(t =>
+                                         {
+                                             if (t.IsFaulted)
+                                             {
+                                                 Log.Error(t.Exception, "Error in LoadAllPlugins()");
+                                             }
+
+                                             _ = Task.Run(Troubleshooting.LogTroubleshooting);
+                                         });
+
+                // We wait for all blocking services and tasks to finish before kicking off the main thread in any mode.
+                // This means that we don't want to block here if this stupid thing isn't enabled.
+                if (this.configuration.IsResumeGameAfterPluginLoad)
+                {
+                    Log.Verbose("Waiting for all plugins to load before resuming game");
+                    loadAllPlugins.Wait();
+                }
+
+                Log.Information("Boot load started");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Plugin load failed");
+        }
+    }
+
+    /// <summary>
+    /// Class representing progress of an update operation.
+    /// </summary>
+    public record PluginUpdateProgress(int PluginsProcessed, int TotalPlugins, IPluginManifest CurrentPluginManifest);
+
+    /// <summary>
+    /// Simple class that tracks the internal names and public names of plugins that we are planning to load at startup,
+    /// and are still actively loading.
+    /// </summary>
+    public class StartupLoadTracker
+    {
+        private readonly Dictionary<string, string> internalToPublic = [];
+        private readonly ConcurrentBag<string> allInternalNames = [];
+        private readonly ConcurrentBag<string> finishedInternalNames = [];
+
+        /// <summary>
+        /// Gets a value indicating the total load progress.
+        /// </summary>
+        public float Progress => (float)this.finishedInternalNames.Count / this.allInternalNames.Count;
+
+        /// <summary>
+        /// Calculate a set of internal names that are still pending.
+        /// </summary>
+        /// <returns>Set of pending InternalNames.</returns>
+        public IReadOnlySet<string> GetPendingInternalNames()
+        {
+            var pending = new HashSet<string>(this.allInternalNames);
+            pending.ExceptWith(this.finishedInternalNames);
+            return pending;
+        }
+
+        /// <summary>
+        /// Track a new plugin.
+        /// </summary>
+        /// <param name="internalName">The plugin's internal name.</param>
+        /// <param name="publicName">The plugin's public name.</param>
+        public void Add(string internalName, string publicName)
+        {
+            this.internalToPublic[internalName] = publicName;
+            this.allInternalNames.Add(internalName);
+        }
+
+        /// <summary>
+        /// Mark a plugin as finished loading.
+        /// </summary>
+        /// <param name="internalName">The internal name of the plugin.</param>
+        public void Finish(string internalName)
+        {
+            this.finishedInternalNames.Add(internalName);
+        }
+
+        /// <summary>
+        /// Get the public name for a given internal name.
+        /// </summary>
+        /// <param name="internalName">The internal name to look up.</param>
+        /// <returns>The public name.</returns>
+        public string? GetPublicName(string internalName)
+        {
+            return this.internalToPublic.TryGetValue(internalName, out var publicName) ? publicName : null;
+        }
+    }
+
+    private static class Locs
+    {
+        public static string DalamudPluginUpdateSuccessful(string name, Version version) => Loc.Localize("DalamudPluginUpdateSuccessful", "    》 {0} updated to v{1}.").Format(name, version);
+
+        public static string DalamudPluginUpdateFailed(string name, Version version, string why) => Loc.Localize("DalamudPluginUpdateFailed", "    》 {0} update to v{1} failed ({2}).").Format(name, version, why);
+    }
+}

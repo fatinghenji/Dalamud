@@ -1,15 +1,9 @@
 apiRules:
 - exclude:
-    uidRegex: ^Dalamud\.Discord
+    uidRegex: ^SDL2
 - exclude:
-    uidRegex: ^Dalamud\.Hooking
+    uidRegex: ^Dalamud\.Test
 - exclude:
-    uidRegex: ^Dalamud\.FFNotify
+    uidRegex: ^Dalamud\.Interface\.Internal
 - exclude:
-    uidRegex: ^Dalamud\.Plugin\.PluginManager$
-- exclude:
-    uidRegex: AddressResolver$
-- exclude:
-    uidRegex: ^Dalamud$
-- exclude:
-    uidRegex: ^Discord.Net
+    uidRegex: ^Dalamud\.Game\.Internal
